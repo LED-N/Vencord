@@ -1,0 +1,1266 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <style>
+        :root {
+            /* Updated from the layout of each notification */
+            --alpha: 0.97;
+            --max-width: 460px;
+            --slide: 40px;
+            --slide-y: 0px;
+            --typing-opacity: 0.2;
+
+            --bg: rgba(49, 51, 56, var(--alpha));
+            --embed-bg: rgba(43, 45, 49, var(--alpha));
+            --embed-inner: rgba(30, 31, 34, var(--alpha));
+            --text: #dbdee1;
+            --strong: #f2f3f5;
+            --muted: #949ba4;
+            --link: #00a8fc;
+            --blurple: #5865f2;
+        }
+
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+            background: transparent;
+            overflow: hidden;
+            font-family: "gg sans", "Segoe UI", "Noto Sans", sans-serif;
+            font-size: 14px;
+            color: var(--text);
+            user-select: none;
+        }
+
+        #root {
+            position: absolute;
+            inset: 12px;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            /* Cards shrink to their content instead of filling the column */
+            align-items: flex-end;
+            gap: 8px;
+            transition: opacity 250ms ease;
+        }
+
+        body.top #root {
+            justify-content: flex-start;
+        }
+
+        body.left #root {
+            align-items: flex-start;
+        }
+
+        body.center #root {
+            align-items: center;
+        }
+
+        body.left {
+            --slide: -40px;
+        }
+
+        body.center {
+            --slide: 0px;
+            --slide-y: 24px;
+        }
+
+        body.center.top {
+            --slide-y: -24px;
+        }
+
+        /* The user is typing in another application */
+        body.typing-fade #root {
+            opacity: var(--typing-opacity);
+        }
+
+        body.typing-hide #root {
+            opacity: 0;
+        }
+
+        .n {
+            flex-shrink: 0;
+            min-width: 200px;
+            max-width: min(100%, var(--max-width));
+            max-height: 100%;
+            overflow: hidden;
+            box-sizing: border-box;
+            padding: 12px 14px;
+            border-radius: 10px;
+            background: var(--bg);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+            cursor: pointer;
+            animation: in 220ms ease-out;
+            transition: opacity 300ms ease, transform 300ms ease, border-color 150ms;
+        }
+
+        .n:hover {
+            border-color: rgba(88, 101, 242, 0.8);
+        }
+
+        /* Stays until closed */
+        .n.priority {
+            border-color: rgba(240, 178, 50, 0.85);
+            box-shadow: 0 0 0 1px rgba(240, 178, 50, 0.35), 0 4px 14px rgba(0, 0, 0, 0.45);
+        }
+
+        /* Ghost mode: the hovered box lets the screen behind it show through */
+        .ghost {
+            opacity: 0.12 !important;
+            transition: opacity 120ms ease !important;
+        }
+
+        body.static .n {
+            cursor: default;
+        }
+
+        img {
+            -webkit-user-drag: none;
+        }
+
+        .n {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            touch-action: none;
+        }
+
+        .n.dragging {
+            transition: none;
+            cursor: grabbing;
+        }
+
+        /* Expanded content; only the scroll area shrinks when the card hits the height limit */
+        .full {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .scroll {
+            min-height: 0;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+        }
+
+        /* Collapsed: a single line, used for older cards so a stack of large embeds stays small */
+        .mini {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+            padding-right: 18px;
+        }
+
+        .n.collapsed {
+            padding: 8px 12px;
+        }
+
+        .n.collapsed .full {
+            display: none;
+        }
+
+        .n.collapsed .mini {
+            display: flex;
+        }
+
+        .mini .avatar {
+            width: 24px;
+            height: 24px;
+        }
+
+        .mini-text {
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-size: 13px;
+        }
+
+        .mini-text b {
+            color: var(--strong);
+            font-weight: 600;
+        }
+
+        .mini-text span {
+            color: var(--muted);
+        }
+
+        /* Close button, revealed on hover */
+        .x {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            z-index: 1;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            line-height: 1;
+            color: var(--muted);
+            background: rgba(0, 0, 0, 0.35);
+            opacity: 0;
+            transition: opacity 120ms, color 120ms, background 120ms;
+        }
+
+        .n:hover .x {
+            opacity: 1;
+        }
+
+        .x:hover {
+            color: #fff;
+            background: #da373c;
+        }
+
+        body.static .x {
+            display: none;
+        }
+
+        /* "+N" counter for cards that no longer fit */
+        .more {
+            flex-shrink: 0;
+            padding: 4px 12px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--strong);
+            background: var(--bg);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            cursor: pointer;
+        }
+
+        .more[hidden] {
+            display: none;
+        }
+
+        /* Right-click menu, stacked right after its card */
+        .menu {
+            flex-shrink: 0;
+            min-width: 220px;
+            padding: 6px;
+            border-radius: 8px;
+            background: rgba(17, 18, 20, var(--alpha));
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+            animation: pop 120ms ease-out;
+        }
+
+        .menu-item {
+            padding: 7px 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+        }
+
+        .menu-item:hover {
+            color: #fff;
+            background: var(--blurple);
+        }
+
+        .menu-item.danger {
+            color: #f23f42;
+        }
+
+        .menu-item.danger:hover {
+            color: #fff;
+            background: #da373c;
+        }
+
+        @keyframes pop {
+            from {
+                opacity: 0;
+                transform: scale(0.96);
+            }
+        }
+
+        .n.out {
+            opacity: 0;
+            transform: translate(var(--slide), var(--slide-y));
+        }
+
+        @keyframes in {
+            from {
+                opacity: 0;
+                transform: translate(var(--slide), var(--slide-y));
+            }
+        }
+
+        /* Header */
+        .head {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            object-fit: cover;
+        }
+
+        .ht {
+            min-width: 0;
+        }
+
+        .title,
+        .sub-title {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .title {
+            font-weight: 600;
+            font-size: 15px;
+            color: var(--strong);
+        }
+
+        .sub-title {
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .content {
+            margin-top: 6px;
+        }
+
+        /* Markdown */
+        .md {
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.375;
+        }
+
+        .md code {
+            font-family: Consolas, "Cascadia Mono", monospace;
+            font-size: 0.85em;
+            background: var(--embed-inner);
+            border: 1px solid #1e1f22;
+            border-radius: 4px;
+            padding: 0 3px;
+        }
+
+        .md pre {
+            font-family: Consolas, "Cascadia Mono", monospace;
+            font-size: 0.85em;
+            background: var(--embed-inner);
+            border: 1px solid #1e1f22;
+            border-radius: 4px;
+            padding: 6px 8px;
+            margin: 4px 0;
+            white-space: pre-wrap;
+        }
+
+        .md .quote {
+            border-left: 4px solid #4e5058;
+            padding-left: 10px;
+        }
+
+        .md .subtext {
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .md .h1 { font-size: 1.4em; font-weight: 700; }
+        .md .h2 { font-size: 1.2em; font-weight: 700; }
+        .md .h3 { font-size: 1.05em; font-weight: 700; }
+
+        .md ul,
+        .md ol {
+            margin: 2px 0;
+            padding-left: 20px;
+            white-space: normal;
+        }
+
+        .md li {
+            white-space: pre-wrap;
+        }
+
+        .link {
+            color: var(--link);
+            cursor: pointer;
+        }
+
+        .link:hover {
+            text-decoration: underline;
+        }
+
+        .mention {
+            color: #c9cdfb;
+            background: rgba(88, 101, 242, 0.3);
+            border-radius: 3px;
+            padding: 0 2px;
+            font-weight: 500;
+        }
+
+        .spoiler {
+            background: #1e1f22;
+            color: transparent;
+            border-radius: 3px;
+        }
+
+        .spoiler.shown {
+            background: rgba(255, 255, 255, 0.1);
+            color: inherit;
+        }
+
+        .emoji {
+            width: 1.375em;
+            height: 1.375em;
+            object-fit: contain;
+            vertical-align: bottom;
+        }
+
+        /* Embeds */
+        .embed {
+            display: flex;
+            gap: 12px;
+            margin-top: 8px;
+            padding: 10px 12px 12px;
+            background: var(--embed-bg);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-left: 4px solid #1e1f22;
+            border-radius: 4px;
+        }
+
+        .em {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .thumb {
+            width: 80px;
+            height: 80px;
+            object-fit: contain;
+            border-radius: 4px;
+            flex-shrink: 0;
+        }
+
+        .e-author {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--strong);
+        }
+
+        .e-author img {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+        }
+
+        .e-title {
+            font-weight: 600;
+            font-size: 15px;
+            color: var(--strong);
+        }
+
+        .e-title.link {
+            color: var(--link);
+        }
+
+        .fields {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(90px, 1fr));
+            gap: 8px;
+        }
+
+        .field.full {
+            grid-column: 1 / -1;
+        }
+
+        .f-name {
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--strong);
+            margin-bottom: 2px;
+        }
+
+        .f-value {
+            font-size: 13px;
+        }
+
+        .e-image,
+        .att {
+            display: block;
+            max-width: 100%;
+            max-height: 300px;
+            object-fit: contain;
+            border-radius: 6px;
+            margin-top: 6px;
+        }
+
+        .footer {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .footer img {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+        }
+
+        /* Buttons */
+        .btns {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            height: 32px;
+            padding: 0 14px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #fff;
+            background: #4e5058;
+            cursor: pointer;
+            transition: filter 120ms;
+        }
+
+        .btn:hover {
+            filter: brightness(1.15);
+        }
+
+        .btn.s1 { background: var(--blurple); }
+        .btn.s3 { background: #248046; }
+        .btn.s4 { background: #da373c; }
+
+        .btn.disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            filter: none;
+        }
+
+        .btn img {
+            width: 20px;
+            height: 20px;
+            object-fit: contain;
+        }
+
+        .btn .ext {
+            font-size: 12px;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="root"><div id="more" class="more" hidden></div></div>
+    <script>
+        "use strict";
+
+        // Messages to the main process travel through the console, this page has no other channel
+        const PREFIX = "__VC_BN__";
+        const send = msg => console.log(PREFIX + JSON.stringify(msg));
+
+        const root = document.getElementById("root");
+        const more = document.getElementById("more");
+        const GAP = 8;
+        const MIN_REMAINING = 1500;
+        /** Hovering a collapsed card expands it after this delay, leaving it restores the newest one after LEAVE_DELAY */
+        const EXPAND_DELAY = 150;
+        const LEAVE_DELAY = 400;
+        /** Horizontal drag distance, in pixels, past which a released card is dismissed */
+        const SWIPE_THRESHOLD = 90;
+        let maxVisible = 4;
+        let collapseOlder = true;
+        /** Milliseconds after which the newest card shrinks to a line as well, 0 to never */
+        let autoCollapse = 0;
+        let typingMode = "off";
+        /** Sequence number of the last push, echoed back so the main process ignores stale "empty" reports */
+        let lastSeq = 0;
+        let cssZoom = 1;
+        /** Converts getBoundingClientRect values to window pixels, whichever way this Chromium reports them under CSS zoom */
+        let rectFactor = 1;
+
+        function setCssZoom(zoom) {
+            if (zoom === cssZoom) return;
+            cssZoom = zoom;
+            document.documentElement.style.zoom = zoom === 1 ? "" : String(zoom);
+
+            const probe = el("div");
+            probe.style.cssText = "position:absolute;width:100px;height:1px;visibility:hidden";
+            document.body.append(probe);
+            rectFactor = zoom / (probe.getBoundingClientRect().width / 100);
+            probe.remove();
+        }
+
+        function applyLayout(layout) {
+            const [vertical, horizontal] = layout.position.split("-");
+            document.body.classList.toggle("top", vertical === "top");
+            document.body.classList.toggle("left", horizontal === "left");
+            document.body.classList.toggle("center", horizontal === "center");
+            document.body.classList.toggle("static", !layout.clickable);
+
+            const style = document.documentElement.style;
+            style.setProperty("--alpha", String(layout.opacity));
+            style.setProperty("--max-width", layout.maxWidth + "px");
+            style.setProperty("--typing-opacity", String(layout.typingOpacity));
+
+            maxVisible = layout.maxVisible;
+            collapseOlder = layout.collapseOlder;
+            autoCollapse = layout.autoCollapse;
+            typingMode = layout.typing;
+        }
+
+        function el(tag, className, text) {
+            const e = document.createElement(tag);
+            if (className) e.className = className;
+            if (text != null) e.textContent = text;
+            return e;
+        }
+
+        function img(src, className) {
+            const i = el("img", className);
+            i.src = src;
+            i.addEventListener("load", layoutChanged);
+            i.addEventListener("error", () => { i.remove(); layoutChanged(); });
+            return i;
+        }
+
+        // ── Markdown ──────────────────────────────────────────────────────────
+
+        const WRAPPERS = { b: "strong", i: "em", u: "u", s: "s" };
+
+        function renderRich(nodes, parent) {
+            for (const n of nodes || []) {
+                if (typeof n === "string") {
+                    parent.append(n);
+                    continue;
+                }
+
+                let e;
+                switch (n.t) {
+                    case "b": case "i": case "u": case "s":
+                        e = el(WRAPPERS[n.t]);
+                        renderRich(n.c, e);
+                        break;
+                    case "spoiler":
+                        e = el("span", "spoiler");
+                        e.dataset.spoiler = "";
+                        renderRich(n.c, e);
+                        break;
+                    case "quote":
+                        e = el("div", "quote");
+                        renderRich(n.c, e);
+                        break;
+                    case "sub":
+                        e = el("div", "subtext");
+                        renderRich(n.c, e);
+                        break;
+                    case "h":
+                        e = el("div", "h" + Math.min(3, n.level || 1));
+                        renderRich(n.c, e);
+                        break;
+                    case "code":
+                        e = el("code", null, n.text);
+                        break;
+                    case "pre":
+                        e = el("pre", null, n.text);
+                        break;
+                    case "link":
+                        e = el("span", "link");
+                        e.dataset.url = n.href;
+                        renderRich(n.c, e);
+                        break;
+                    case "mention":
+                        e = el("span", "mention", n.text);
+                        if (n.color) {
+                            e.style.color = n.color;
+                            e.style.background = n.color + "26";
+                        }
+                        break;
+                    case "emoji":
+                        e = img(n.src, "emoji");
+                        e.alt = n.name;
+                        break;
+                    case "list":
+                        e = el(n.ordered ? "ol" : "ul");
+                        if (n.ordered && n.start) e.start = n.start;
+                        for (const item of n.items) {
+                            const li = el("li");
+                            renderRich(item, li);
+                            e.append(li);
+                        }
+                        break;
+                    case "br":
+                        e = document.createTextNode("\n");
+                        break;
+                    default:
+                        continue;
+                }
+                parent.append(e);
+            }
+        }
+
+        function rich(nodes, className) {
+            const e = el("div", "md" + (className ? " " + className : ""));
+            renderRich(nodes, e);
+            return e;
+        }
+
+        // ── Card ──────────────────────────────────────────────────────────────
+
+        function renderEmbed(embed) {
+            const e = el("div", "embed");
+            if (embed.color) e.style.borderLeftColor = embed.color;
+
+            const main = el("div", "em");
+
+            if (embed.author) {
+                const a = el("div", "e-author" + (embed.author.url ? " link" : ""));
+                if (embed.author.url) a.dataset.url = embed.author.url;
+                if (embed.author.icon) a.append(img(embed.author.icon));
+                a.append(el("span", null, embed.author.name));
+                main.append(a);
+            }
+
+            if (embed.title && embed.title.length) {
+                const t = rich(embed.title, "e-title" + (embed.url ? " link" : ""));
+                if (embed.url) t.dataset.url = embed.url;
+                main.append(t);
+            }
+
+            if (embed.description && embed.description.length)
+                main.append(rich(embed.description));
+
+            if (embed.fields.length) {
+                const fields = el("div", "fields");
+                for (const f of embed.fields) {
+                    const field = el("div", "field" + (f.inline ? "" : " full"));
+                    field.append(rich(f.name, "f-name"), rich(f.value, "f-value"));
+                    fields.append(field);
+                }
+                main.append(fields);
+            }
+
+            if (embed.image) main.append(img(embed.image.src, "e-image"));
+
+            if (embed.footer) {
+                const footer = el("div", "footer");
+                if (embed.footer.icon) footer.append(img(embed.footer.icon));
+                const parts = [embed.footer.text, embed.footer.timestamp].filter(Boolean);
+                footer.append(el("span", null, parts.join(" • ")));
+                main.append(footer);
+            }
+
+            e.append(main);
+            if (embed.thumbnail) e.append(img(embed.thumbnail, "thumb"));
+            return e;
+        }
+
+        function renderButtons(buttons) {
+            const row = el("div", "btns");
+            buttons.forEach((b, index) => {
+                const btn = el("div", "btn s" + b.style + (b.disabled ? " disabled" : ""));
+                if (!b.disabled) {
+                    if (b.url) btn.dataset.url = b.url;
+                    else btn.dataset.button = index;
+                }
+                if (b.emoji) {
+                    if (b.emoji.src) btn.append(img(b.emoji.src));
+                    else if (b.emoji.text) btn.append(el("span", null, b.emoji.text));
+                }
+                if (b.label) btn.append(el("span", null, b.label));
+                if (b.url) btn.append(el("span", "ext", "↗"));
+                row.append(btn);
+            });
+            return row;
+        }
+
+        function fillCard(card, n) {
+            const head = el("div", "head");
+            if (n.icon) head.append(img(n.icon, "avatar"));
+            const ht = el("div", "ht");
+            ht.append(el("div", "title", n.title));
+            if (n.subtitle) ht.append(el("div", "sub-title", n.subtitle));
+            head.append(ht);
+
+            const scroll = el("div", "scroll");
+            if (n.content && n.content.length) scroll.append(rich(n.content, "content"));
+            for (const embed of n.embeds || []) scroll.append(renderEmbed(embed));
+            for (const image of n.images || []) scroll.append(img(image.src, "att"));
+            if (n.buttons && n.buttons.length) scroll.append(renderButtons(n.buttons));
+
+            const full = el("div", "full");
+            full.append(head, scroll);
+
+            const mini = el("div", "mini");
+            if (n.icon) mini.append(img(n.icon, "avatar"));
+            const miniText = el("div", "mini-text");
+            miniText.append(el("b", null, n.title));
+            if (n.preview) miniText.append(el("span", null, " · " + n.preview));
+            mini.append(miniText);
+
+            const close = el("div", "x", "✕");
+            close.dataset.close = "";
+            close.title = "Fermer";
+
+            card.replaceChildren(close, full, mini);
+        }
+
+        // ── Lifetime ──────────────────────────────────────────────────────────
+
+        function startTimer(card) {
+            card._paused = false;
+            // Priority cards stay until closed
+            if (card._priority) return;
+            card._startedAt = Date.now();
+            card._timer = setTimeout(() => dismiss(card), card._remaining);
+        }
+
+        function pauseTimer(card) {
+            if (card._paused || card._gone || card._priority) return;
+            card._paused = true;
+            clearTimeout(card._timer);
+            card._remaining = Math.max(MIN_REMAINING, card._remaining - (Date.now() - card._startedAt));
+        }
+
+        function resumeTimer(card) {
+            if (card._paused && !card._gone) startTimer(card);
+        }
+
+        /** Restarts the display time, used when a newer message of the same conversation takes the card over */
+        function restartTimer(card, duration) {
+            clearTimeout(card._timer);
+            card._remaining = duration;
+            if (!card._paused) startTimer(card);
+        }
+
+        function scheduleAutoCollapse(card) {
+            clearTimeout(card._collapseTimer);
+            card._autoCollapsed = false;
+            if (autoCollapse > 0) card._collapseTimer = setTimeout(() => {
+                card._autoCollapsed = true;
+                refreshExpanded();
+            }, autoCollapse);
+        }
+
+        /** @param direction -1 or 1 to fly out to that side (swipe), omitted for the default exit */
+        function dismiss(card, direction) {
+            if (card._gone) return;
+            card._gone = true;
+            clearTimeout(card._timer);
+            clearTimeout(card._collapseTimer);
+            if (menu && menu.card === card) closeMenu();
+            if (direction) {
+                card.style.transform = `translateX(${direction * (card.offsetWidth + 40)}px)`;
+                card.style.opacity = "0";
+            }
+            card.classList.add("out");
+            send({ type: "action", action: { type: "closed", ids: [card.dataset.id] } });
+            setTimeout(() => {
+                card.remove();
+                if (hovered === card) hovered = null;
+                refreshExpanded();
+            }, 300);
+        }
+
+        // ── Accordion: one expanded card, the others collapsed to a line ──────
+
+        let hovered = null;
+        let expandTimer = null;
+
+        function liveCards() {
+            return cards().filter(c => !c._gone);
+        }
+
+        function refreshExpanded() {
+            const list = liveCards();
+            const target = hovered && list.includes(hovered) ? hovered : list[list.length - 1];
+            for (const c of list)
+                c.classList.toggle("collapsed", c !== hovered && ((collapseOlder && c !== target) || !!c._autoCollapsed));
+            layoutChanged();
+        }
+
+        function onEnter(card) {
+            pauseTimer(card);
+            clearTimeout(expandTimer);
+            // A card under the mouse is never faded, whatever the last typing report said
+            window.setTyping(false);
+            expandTimer = setTimeout(() => {
+                hovered = card;
+                refreshExpanded();
+            }, card.classList.contains("collapsed") ? EXPAND_DELAY : 0);
+        }
+
+        function onLeave(card) {
+            resumeTimer(card);
+            clearTimeout(expandTimer);
+            expandTimer = setTimeout(() => {
+                if (hovered !== card) return;
+                hovered = null;
+                refreshExpanded();
+            }, LEAVE_DELAY);
+        }
+
+        /** Called by the main process when the cursor left the cards, in case the page missed mouseleave */
+        window.pointerLeft = () => {
+            clearTimeout(expandTimer);
+            closeMenu();
+            // The main process keeps the mouse during a real swipe, so a drag still pending here lost its release
+            cancelDrag();
+            liveCards().forEach(resumeTimer);
+            if (hovered) {
+                hovered = null;
+                refreshExpanded();
+            }
+        };
+
+        // ── Swipe to dismiss ──────────────────────────────────────────────────
+
+        let drag = null;
+
+        function onPointerDown(card, e) {
+            if (e.button !== 0 || e.target.closest("[data-close]")) return;
+            drag = { card, pointerId: e.pointerId, startX: e.clientX, dx: 0, moved: false };
+        }
+
+        /** Drops a drag whose button release was missed, putting the card back in place */
+        function cancelDrag() {
+            if (!drag) return;
+            const { card, moved } = drag;
+            drag = null;
+            if (!moved) return;
+
+            send({ type: "drag", active: false });
+            card.classList.remove("dragging");
+            card.style.transform = "";
+            card.style.opacity = "";
+        }
+
+        document.addEventListener("pointermove", e => {
+            if (!drag || e.pointerId !== drag.pointerId) return;
+
+            // The release can happen while the window ignores the mouse (cursor next to the card): without this check,
+            // the card later followed the cursor with no button pressed, half transparent, until the next click
+            if (!(e.buttons & 1)) {
+                cancelDrag();
+                return;
+            }
+
+            const dx = e.clientX - drag.startX;
+            if (!drag.moved) {
+                if (Math.abs(dx) < 6) return;
+                drag.moved = true;
+                drag.card.setPointerCapture(drag.pointerId);
+                drag.card.classList.add("dragging");
+                // Keep the window capturing the mouse even when the card leaves its hit box
+                send({ type: "drag", active: true });
+            }
+
+            drag.dx = dx;
+            drag.card.style.transform = `translateX(${dx}px)`;
+            drag.card.style.opacity = String(Math.max(0.2, 1 - Math.abs(dx) / 300));
+        });
+
+        function endDrag(e) {
+            if (!drag || e.pointerId !== drag.pointerId) return;
+            const { card, moved, dx } = drag;
+            drag = null;
+            if (!moved) return;
+
+            send({ type: "drag", active: false });
+            card.classList.remove("dragging");
+            // The click that follows a drag must not open the message
+            card._suppressClick = true;
+            setTimeout(() => card._suppressClick = false, 0);
+
+            if (Math.abs(dx) > SWIPE_THRESHOLD) {
+                dismiss(card, Math.sign(dx));
+            } else {
+                card.style.transform = "";
+                card.style.opacity = "";
+            }
+        }
+
+        document.addEventListener("pointerup", endDrag);
+        document.addEventListener("pointercancel", endDrag);
+
+        // ── Clicks ────────────────────────────────────────────────────────────
+
+        // ── Right-click menu ──────────────────────────────────────────────────
+
+        /** The open menu: { el, card } */
+        let menu = null;
+
+        function closeMenu() {
+            if (!menu) return;
+            menu.el.remove();
+            menu = null;
+            layoutChanged();
+        }
+
+        function openMenu(card, e) {
+            e.preventDefault();
+            const reopen = !menu || menu.card !== card;
+            closeMenu();
+            if (!reopen || !card._menu || !card._menu.length || document.body.classList.contains("static")) return;
+
+            const m = el("div", "menu");
+            for (const item of card._menu) {
+                const entry = el("div", "menu-item" + (item.danger ? " danger" : ""), item.label);
+                entry.dataset.key = item.key;
+                m.append(entry);
+            }
+            m.addEventListener("click", ev => {
+                const entry = ev.target.closest("[data-key]");
+                if (!entry) return;
+                send({ type: "action", action: { type: "menu", id: card.dataset.id, key: entry.dataset.key } });
+                closeMenu();
+            });
+            m.addEventListener("contextmenu", ev => ev.preventDefault());
+            // The card keeps waiting while its menu is used
+            m.addEventListener("mouseenter", () => pauseTimer(card));
+            m.addEventListener("mouseleave", () => resumeTimer(card));
+
+            card.after(m);
+            menu = { el: m, card };
+            layoutChanged();
+        }
+
+        function onCardClick(card, e) {
+            if (card._suppressClick) return;
+            const id = card.dataset.id;
+            closeMenu();
+
+            if (e.target.closest("[data-close]")) {
+                dismiss(card);
+                return;
+            }
+
+            const spoiler = e.target.closest("[data-spoiler]");
+            if (spoiler && !spoiler.classList.contains("shown")) {
+                spoiler.classList.add("shown");
+                return;
+            }
+
+            const button = e.target.closest("[data-button]");
+            if (button) {
+                send({ type: "action", action: { type: "button", id, index: Number(button.dataset.button) } });
+                dismiss(card);
+                return;
+            }
+
+            const link = e.target.closest("[data-url]");
+            if (link) {
+                send({ type: "link", url: link.dataset.url });
+                return;
+            }
+
+            send({ type: "action", action: { type: "jump", id } });
+            dismiss(card);
+        }
+
+        function findCard(id) {
+            return liveCards().find(c => c.dataset.id === id);
+        }
+
+        window.pushNotification = (n, seq, zoom) => {
+            lastSeq = seq;
+            setCssZoom(zoom);
+            applyLayout(n.layout);
+
+            const existing = findCard(n.id);
+            if (existing) {
+                fillCard(existing, n);
+                existing._menu = n.menu;
+                layoutChanged();
+                return;
+            }
+            if (n.update) {
+                // Report back anyway, so the main process can hide the window if nothing is left
+                layoutChanged();
+                return;
+            }
+
+            // A newer message of the same conversation: the card moves to the newest spot and starts over
+            const previous = n.replaces && findCard(n.replaces);
+            if (previous) {
+                if (menu && menu.card === previous) closeMenu();
+                previous.dataset.id = n.id;
+                previous._menu = n.menu;
+                previous._priority = !!n.priority;
+                previous.classList.toggle("priority", !!n.priority);
+                fillCard(previous, n);
+                root.append(previous);
+                restartTimer(previous, n.duration);
+                scheduleAutoCollapse(previous);
+                refreshExpanded();
+                return;
+            }
+
+            const card = el("div", "n" + (n.priority ? " priority" : ""));
+            card.dataset.id = n.id;
+            card._menu = n.menu;
+            card._priority = !!n.priority;
+            fillCard(card, n);
+
+            card._remaining = n.duration;
+            card.addEventListener("mouseenter", () => onEnter(card));
+            card.addEventListener("mouseleave", () => onLeave(card));
+            card.addEventListener("pointerdown", e => onPointerDown(card, e));
+            card.addEventListener("click", e => onCardClick(card, e));
+            card.addEventListener("contextmenu", e => openMenu(card, e));
+
+            root.append(card);
+            resizeObserver.observe(card);
+            startTimer(card);
+            scheduleAutoCollapse(card);
+            refreshExpanded();
+        };
+
+        /** Global shortcut */
+        window.dismissAll = () => {
+            closeMenu();
+            liveCards().forEach(c => dismiss(c));
+            overflowCount = 0;
+            updateMore();
+            layoutChanged();
+        };
+
+        /** Ghost mode: fades the box at this index of the last reported rects, -1 for none */
+        window.setGhost = index => {
+            document.querySelectorAll(".ghost").forEach(e => e.classList.remove("ghost"));
+            const box = reportedBoxes[index];
+            if (box) box.classList.add("ghost");
+        };
+
+        window.setTyping = active => {
+            document.body.classList.remove("typing-fade", "typing-hide");
+            if (active && typingMode !== "off") document.body.classList.add("typing-" + typingMode);
+        };
+
+        // ── "+N" counter ──────────────────────────────────────────────────────
+
+        let overflowCount = 0;
+
+        function updateMore() {
+            more.hidden = overflowCount === 0;
+            more.textContent = `+${overflowCount} notification${overflowCount > 1 ? "s" : ""}`;
+        }
+
+        more.addEventListener("click", () => {
+            overflowCount = 0;
+            updateMore();
+            send({ type: "focus" });
+            layoutChanged();
+        });
+
+        // ── Layout reporting ──────────────────────────────────────────────────
+
+        function cards() {
+            return [...root.querySelectorAll(":scope > .n")];
+        }
+
+        /** The expanded card gives up height (and scrolls) to keep older cards visible, down to this share of the column */
+        const MIN_EXPANDED_SHARE = 0.5;
+
+        /** Caps the expanded card so that the collapsed ones fit next to it */
+        function capExpanded(list) {
+            const expanded = list.filter(c => !c.classList.contains("collapsed"));
+            for (const c of list) c.style.maxHeight = "";
+            if (!collapseOlder || expanded.length !== 1) return;
+
+            const others = list.filter(c => c !== expanded[0]);
+            const othersHeight = others.reduce((h, c) => h + c.offsetHeight + GAP, 0)
+                + (more.hidden ? 0 : more.offsetHeight + GAP);
+            const available = root.clientHeight - othersHeight;
+            expanded[0].style.maxHeight = Math.max(available, root.clientHeight * MIN_EXPANDED_SHARE) + "px";
+        }
+
+        /**
+         * Drops the oldest cards beyond the limit, or when the stack no longer fits in the window,
+         * after the expanded card has shrunk as much as allowed.
+         */
+        function fit() {
+            const stackHeight = list => list.reduce((h, c) => h + c.offsetHeight, 0)
+                + GAP * (list.length - 1)
+                + (more.hidden ? 0 : more.offsetHeight + GAP);
+
+            // Cards fading out are about to leave, they must not push the others out
+            let list = liveCards();
+            capExpanded(list);
+            while (list.length > 1 && (list.length > maxVisible || stackHeight(list) > root.clientHeight)) {
+                const victim = list.find(c => c.classList.contains("collapsed") && c !== hovered && !c._priority)
+                    ?? list.find(c => c !== hovered && !c._priority)
+                    ?? list[0];
+                clearTimeout(victim._timer);
+                clearTimeout(victim._collapseTimer);
+                if (menu && menu.card === victim) closeMenu();
+                victim.remove();
+                send({ type: "action", action: { type: "closed", ids: [victim.dataset.id] } });
+                overflowCount++;
+                updateMore();
+                list = liveCards();
+                capExpanded(list);
+            }
+        }
+
+        /** Boxes in the order of the last rects report, so the main process can refer to them by index */
+        let reportedBoxes = [];
+        /** Hit boxes grow by half the gap, so moving from a card to its menu or neighbour never releases the mouse */
+        const HIT_SLOP = GAP / 2 + 1;
+
+        let layoutQueued = false;
+        function layoutChanged() {
+            if (layoutQueued) return;
+            layoutQueued = true;
+            requestAnimationFrame(() => {
+                layoutQueued = false;
+                fit();
+                const list = cards();
+                if (!list.length) {
+                    overflowCount = 0;
+                    updateMore();
+                    reportedBoxes = [];
+                    send({ type: "empty", seq: lastSeq });
+                    return;
+                }
+                // Hit boxes of the cards, the counter and the menu, so the main process only captures the mouse above them
+                const boxes = more.hidden ? [...list] : [more, ...list];
+                if (menu) boxes.push(menu.el);
+                reportedBoxes = boxes;
+                send({
+                    type: "rects",
+                    rects: boxes.map(c => {
+                        const r = c.getBoundingClientRect();
+                        return [r.left - HIT_SLOP, r.top - HIT_SLOP, r.right + HIT_SLOP, r.bottom + HIT_SLOP].map(v => v * rectFactor);
+                    })
+                });
+            });
+        }
+
+        const resizeObserver = new ResizeObserver(layoutChanged);
+        resizeObserver.observe(root);
+        root.addEventListener("transitionend", layoutChanged);
+        root.addEventListener("animationend", layoutChanged);
+    </script>
+</body>
+
+</html>

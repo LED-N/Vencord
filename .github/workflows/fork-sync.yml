@@ -1,0 +1,63 @@
+# Brings Vencord's official changes into this fork, then publishes a new build.
+# The fork only adds files (src/userplugins, these workflows), so the merge never touches them.
+name: Sync with Vencord
+on:
+    schedule:
+        - cron: "23 */3 * * *" # every 3 hours
+    workflow_dispatch:
+
+permissions:
+    contents: write
+    actions: write
+
+concurrency:
+    group: fork-sync
+    cancel-in-progress: false
+
+jobs:
+    sync:
+        if: github.repository == 'LED-N/Vencord'
+        runs-on: ubuntu-latest
+
+        steps:
+            # SYNC_TOKEN (optional, fine-grained token with Contents and Workflows write access to this repository) is
+            # needed when Vencord changes its own workflow files: GitHub refuses those changes from the default token
+            - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+                  token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+            - name: Merge Vencord's main branch
+              id: merge
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git remote add upstream https://github.com/Vendicated/Vencord.git
+                  git fetch upstream main
+
+                  if git merge-base --is-ancestor upstream/main HEAD; then
+                      echo "Already up to date with Vencord."
+                      echo "changed=false" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+
+                  git merge --no-edit upstream/main
+                  if ! git push origin HEAD:main; then
+                      echo "::error::Push refused. If Vencord changed its workflow files, add a SYNC_TOKEN secret (see the comment in this file)."
+                      exit 1
+                  fi
+                  echo "changed=true" >> "$GITHUB_OUTPUT"
+
+            # Pushes made with the default token start no other workflow, so the release is started explicitly.
+            # With SYNC_TOKEN, the push itself already starts it.
+            - name: Publish the new build
+              if: steps.merge.outputs.changed == 'true'
+              run: |
+                  if [ "$HAS_SYNC_TOKEN" = "true" ]; then
+                      echo "The push started the release."
+                  else
+                      gh workflow run fork-release.yml --ref main
+                  fi
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}

@@ -1,0 +1,59 @@
+# Builds this fork (Vencord + src/userplugins) and publishes it as the "devbuild" release.
+# Vencord's updater, in builds made here, checks this repository's latest release: every push reaches every install.
+name: Fork release
+on:
+    push:
+        branches:
+            - main
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+# One publication at a time, in order: a cancelled upload could leave a release with mixed files
+concurrency:
+    group: fork-release
+    cancel-in-progress: false
+
+env:
+    FORCE_COLOR: true
+
+jobs:
+    release:
+        if: github.repository == 'LED-N/Vencord'
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v7
+
+            - uses: pnpm/action-setup@v6 # Install pnpm using packageManager key in package.json
+
+            - name: Use Node.js 24
+              uses: actions/setup-node@v6
+              with:
+                  node-version: 24
+                  cache: "pnpm"
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Build
+              run: pnpm build --standalone
+              env:
+                  # The updater of the build reads its releases from this repository
+                  VENCORD_REMOTE: ${{ github.repository }}
+
+            - name: Publish the release
+              run: |
+                  TAG=$(git rev-parse --short HEAD)
+                  rm -rf dist/*-unpacked dist/vendor
+
+                  if ! gh release view devbuild > /dev/null 2>&1; then
+                      gh release create devbuild --title "DevBuild $TAG" --notes "Vencord + plugins de LEDEN, construit automatiquement." --latest
+                  fi
+
+                  # Files first, title last: the updater compares the hash at the end of the title with its own
+                  gh release upload devbuild --clobber dist/*.js dist/*.css
+                  gh release edit devbuild --title "DevBuild $TAG" --latest
+              env:
+                  GH_TOKEN: ${{ github.token }}
