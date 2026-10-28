@@ -4,22 +4,25 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { SettingsStore } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin, { PluginNative, ReporterTestable } from "@utils/types";
 import type { Channel } from "@vencord/discord-types";
 import { findByCodeLazy, waitFor } from "@webpack";
 import {
-    ApplicationStreamingStore, AuthenticationStore, Button, ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, NavigationRouter,
+    ApplicationStreamingStore, AuthenticationStore, ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, NavigationRouter,
     PresenceStore, ReadStateStore, RelationshipStore, RestAPI, SelectedChannelStore, showToast, SnowflakeUtils, StreamerModeStore,
     UserGuildSettingsStore, UserStore, WindowStore
 } from "@webpack/common";
 
 import { collectButtons, convertButton, convertEmbed, FormatOptions, imageAttachments, plainText, RawAuthor, RawComponent, RawMessage, toRich } from "./format";
 import { contextMenus } from "./menus";
-import { matchesKeyword, pruneExpired, resolve, Rule, RuleKind, scopeChain, withRule } from "./rules";
-import { settings } from "./settings";
+import { Level, matchesKeyword, MentionKind, migrateRules, pruneExpired, resolve, Rule, RuleKind, scopeChain, SoundLevel, sourceOf, withRule } from "./rules";
+import { settings, sourceDefaults } from "./settings";
 import managedStyle from "./styles.css?managed";
 import type { HoverBehavior, OverlayAction, OverlayDisplay, OverlayLayout, OverlayMenuItem, OverlayNotification, OverlayPosition, TypingBehavior, TypingTrigger } from "./types";
+import { bridge } from "./ui/bridge";
+import { openSettings } from "./ui/SettingsModal";
 
 const Native = VencordNative.pluginHelpers.BetterNotifications as PluginNative<typeof import("./native")>;
 const logger = new Logger("BetterNotifications");
@@ -136,46 +139,31 @@ function subtitleFor(channel: Channel) {
 
 // ── Decision ───────────────────────────────────────────────────────────────────
 
-function isMentioned(message: RawMessage, channel: Channel) {
+function mentionMatches(message: RawMessage, channel: Channel, kinds: MentionKind[]) {
     const me = UserStore.getCurrentUser()?.id;
-    if (message.mention_everyone || message.mentions?.some(u => u.id === me)) return true;
-    if (!channel.guild_id || !message.mention_roles?.length) return false;
+    // In a one-to-one conversation, every message is addressed to you
+    if (kinds.includes("me") && (channel.isDM() || message.mentions?.some(u => u.id === me))) return true;
+    if (kinds.includes("everyone") && message.mention_everyone) return true;
+    if (kinds.includes("keywords") && matchesKeyword(message.content, settings.store.keywords)) return true;
+    if (!kinds.includes("roles") || !channel.guild_id || !message.mention_roles?.length) return false;
 
     const roles = GuildMemberStore.getMember(channel.guild_id, me)?.roles ?? [];
     return message.mention_roles.some(r => roles.includes(r));
 }
 
-/** Discord's own verdict, with a simple mute check if its function cannot be found any more */
-function discordWouldNotify(message: RawMessage, channel: Channel) {
+/** Discord's own verdict, with a simple mute check if its function cannot be found any more. ignoreStatus: as if not in Do Not Disturb */
+function discordWouldNotify(message: RawMessage, channel: Channel, ignoreStatus = false) {
     try {
-        return !!discordShouldNotify(message, message.channel_id);
+        return !!discordShouldNotify(message, message.channel_id, true, ignoreStatus);
     } catch (e) {
         if (!warnedShouldNotify) {
             warnedShouldNotify = true;
             logger.error("Discord's notification check is unavailable, falling back to mutes only", e);
         }
-        if (PresenceStore.getStatus(UserStore.getCurrentUser()?.id) === "dnd") return false;
+        if (!ignoreStatus && PresenceStore.getStatus(UserStore.getCurrentUser()?.id) === "dnd") return false;
         if (!channel.guild_id) return true;
-        return isMentioned(message, channel)
+        return mentionMatches(message, channel, ["me", "roles", "everyone"])
             || (!UserGuildSettingsStore.isMuted(channel.guild_id) && !UserGuildSettingsStore.isChannelMuted(channel.guild_id, channel.id));
-    }
-}
-
-/** What the "Servers", "DMs" and "Group DMs" settings let through when no rule applies */
-function allowedByType(message: RawMessage, channel: Channel) {
-    if (channel.isDM()) {
-        switch (settings.store.dms) {
-            case "all": return true;
-            case "friends": return RelationshipStore.isFriend(message.author.id);
-            default: return false;
-        }
-    }
-    if (channel.isGroupDM()) return settings.store.groupDms;
-
-    switch (settings.store.servers) {
-        case "all": return true;
-        case "mentions": return isMentioned(message, channel);
-        default: return false;
     }
 }
 
@@ -186,40 +174,52 @@ function decide(message: RawMessage, channel: Channel): Decision | null {
     if (RelationshipStore.isBlockedOrIgnored?.(message.author.id) ?? RelationshipStore.isBlocked(message.author.id)) return null;
     if ((message.flags ?? 0) & SUPPRESS_NOTIFICATIONS) return null;
 
-    const rule = resolve(settings.store.rules, scopeChain(message.author.id, channel));
+    const rule = resolve(settings.store.rules, scopeChain(message.author.id, channel), sourceDefaults(sourceOf(channel)));
     const discordWould = discordWouldNotify(message, channel);
+    // What Discord would notify outside Do Not Disturb, which priority rules go through
+    const discordAllows = rule.priority && !discordWould ? discordWouldNotify(message, channel, true) : discordWould;
     // Priority rules also go through Do Not Disturb
     const quiet = !rule.priority && PresenceStore.getStatus(me) === "dnd";
 
-    let show: boolean;
-    if (rule.show === "never") show = false;
-    else if (rule.show === "always") show = !quiet;
-    else if (rule.show === "mentions") show = !quiet && isMentioned(message, channel);
-    else if (matchesKeyword(message.content, settings.store.keywords)) show = !quiet;
-    else show = discordWould && allowedByType(message, channel);
+    // Keywords count as mentions, which Discord would have notified even in a muted channel
+    const keyword = () => rule.mentions.includes("keywords") && matchesKeyword(message.content, settings.store.keywords);
+    const passes = (level: Level) => {
+        if (quiet) return false;
+        switch (level) {
+            case "all": return true;
+            case "discord": return discordAllows || keyword();
+            case "friends": return discordAllows && RelationshipStore.isFriend(message.author.id);
+            case "mentions": return mentionMatches(message, channel, rule.mentions);
+            default: return false;
+        }
+    };
 
-    const soundRule = rule.sound ?? (rule.show === "never" ? "off" : undefined);
+    const show = passes(rule.notify);
     return {
         show,
-        sound: soundRule === "on" || (soundRule !== "off" && show && settings.store.sound),
+        sound: passes(rule.sound),
         priority: rule.priority,
         discordWould,
-        suppressNative: settings.store.hideNativeNotifications || rule.show === "never" || rule.snoozed
+        // Whatever the overlay does not show, Discord must not show either
+        suppressNative: settings.store.hideNativeNotifications || !show
     };
 }
 
 /**
  * Our own decision about the timing, independent of Discord's desktop notifications: Discord skips them when its in-game
  * overlay handles the message, when desktop notifications are set to "never", or when it wrongly believes it is focused.
+ * viewing: the conversation is open in a focused Discord, nothing at all is due; blocked: only the card is held back
  */
-async function canShowNow(channel: Channel) {
+async function focusState(channel: Channel) {
     const open = SelectedChannelStore.getChannelId() === channel.id;
-    if (!open && !settings.store.onlyWhenUnfocused) return true;
+    if (!open && !settings.store.onlyWhenUnfocused) return { viewing: false, blocked: false };
 
     // Discord's own focus state can be stale after switching to a game, so the OS focus has the final say
     const osFocused = await Native.isDiscordFocused().catch(() => false);
-    if (settings.store.onlyWhenUnfocused && osFocused) return false;
-    return !open || !(WindowStore.isFocused() && osFocused);
+    return {
+        viewing: open && WindowStore.isFocused() && osFocused,
+        blocked: settings.store.onlyWhenUnfocused && osFocused
+    };
 }
 
 // ── Building the card ──────────────────────────────────────────────────────────
@@ -243,13 +243,16 @@ function menuFor(message: RawMessage, channel: Channel): OverlayMenuItem[] {
         { key: "snooze-channel", label: `Silence 1 h pour ${where}` }
     ];
 
-    if (channel.guild_id) items.push({ key: "sound-guild", label: "Couper le son de ce serveur" });
-    else items.push({ key: "sound-channel", label: `Couper le son de ${where}` });
+    if (channel.guild_id) {
+        items.push({ key: "mentions-guild", label: "Mentions seulement pour ce serveur" });
+        items.push({ key: "sound-guild", label: "Couper le son de ce serveur" });
+    } else items.push({ key: "sound-channel", label: `Couper le son de ${where}` });
 
     if (!channel.isDM()) items.push({ key: "vip", label: `Toujours notifier ${authorName(message, channel)}` });
 
-    items.push({ key: "hide-channel", label: `Ne plus afficher ${where}`, danger: true });
-    if (channel.guild_id) items.push({ key: "hide-guild", label: "Ne plus afficher ce serveur", danger: true });
+    items.push({ key: "hide-channel", label: `Ne plus notifier ${where}`, danger: true });
+    if (channel.guild_id) items.push({ key: "hide-guild", label: "Ne plus notifier ce serveur", danger: true });
+    items.push({ key: "settings", label: "Réglages de BetterNotifications…" });
     return items;
 }
 
@@ -503,20 +506,26 @@ function handleMenu(entry: Tracked, key: string) {
         case "snooze-channel":
             setRule(channel.id, "channel", { snoozedUntil: Date.now() + SNOOZE }, `Silence d'une heure pour ${where}`);
             break;
+        case "mentions-guild":
+            setRule(channel.guild_id, "guild", { notify: "mentions" }, "Seules les mentions de ce serveur seront notifiées");
+            break;
         case "sound-guild":
-            setRule(channel.guild_id, "guild", { sound: "off" }, "Son coupé pour ce serveur");
+            setRule(channel.guild_id, "guild", { sound: "none" }, "Son coupé pour ce serveur");
             break;
         case "sound-channel":
-            setRule(channel.id, "channel", { sound: "off" }, `Son coupé pour ${where}`);
+            setRule(channel.id, "channel", { sound: "none" }, `Son coupé pour ${where}`);
             break;
         case "vip":
-            setRule(message.author.id, "user", { show: "always" }, `${authorName(message, channel)} sera toujours notifié`);
+            setRule(message.author.id, "user", { notify: "all" }, `${authorName(message, channel)} sera toujours notifié`);
             break;
         case "hide-channel":
-            setRule(channel.id, "channel", { show: "never" }, `${where} ne sera plus affiché`);
+            setRule(channel.id, "channel", { notify: "none", sound: "none" }, `${where} ne sera plus notifié`);
             break;
         case "hide-guild":
-            setRule(channel.guild_id, "guild", { show: "never" }, "Ce serveur ne sera plus affiché");
+            setRule(channel.guild_id, "guild", { notify: "none", sound: "none" }, "Ce serveur ne sera plus notifié");
+            break;
+        case "settings":
+            openSettings("exceptions");
             break;
     }
 }
@@ -565,6 +574,65 @@ async function actionLoop() {
     }
 }
 
+// ── Settings migration ─────────────────────────────────────────────────────────
+
+/**
+ * Settings saved before notifications and sounds were set apart: "servers" all / mentions / chosen / none,
+ * "dms" all / friends / chosen / none, "groupDms" and "sound" on / off. The "chosen" modes became a disabled source
+ * whose exceptions still go through, which is what they did.
+ */
+function migrateSettings() {
+    const raw = SettingsStore.plain.plugins.BetterNotifications as Record<string, any> | undefined;
+    if (!raw) return;
+
+    const old = ["servers", "dms", "groupDms", "sound"].filter(k => Object.hasOwn(raw, k));
+    if (old.length) {
+        const sound: SoundLevel = raw.sound === false ? "none" : "same";
+        const level = (value: unknown): Level => value === "mentions" ? "mentions" : value === "friends" ? "friends" : value === "all" || value === undefined ? "discord" : "none";
+
+        settings.store.serversNotify = level(raw.servers);
+        settings.store.dmsNotify = level(raw.dms);
+        settings.store.groupsNotify = raw.groupDms === false ? "none" : "discord";
+        settings.store.serversSound = settings.store.dmsSound = settings.store.groupsSound = sound;
+
+        for (const key of old) delete raw[key];
+        SettingsStore.markAsChanged();
+        logger.info("Migrated the notification filters to the new settings", old);
+    }
+
+    const rules = migrateRules(settings.store.rules);
+    if (rules) settings.store.rules = rules;
+}
+
+function sendTest() {
+    // A new id each time, to try the stacking with several clicks
+    const id = `test-${Date.now()}`;
+    displayed.add(id);
+    show({
+        id,
+        title: "Notification de test",
+        subtitle: "BetterNotifications",
+        icon: "https://cdn.discordapp.com/embed/avatars/0.png",
+        preview: "Si tu vois ceci par-dessus ton jeu, ça fonctionne !",
+        content: ["Si tu vois ceci par-dessus ton jeu, ", { t: "b", c: ["ça fonctionne"] }, " !"],
+        embeds: settings.store.fullEmbeds ? [{
+            color: "#5865f2",
+            title: ["Exemple d'embed"],
+            url: "https://vencord.dev",
+            description: ["Survole la carte pour mettre le compte à rebours en pause, ", { t: "code", text: "clique" }, " pour aller au message, clic droit pour les options."],
+            fields: [
+                { name: ["Prix"], value: [{ t: "code", text: "29,38€" }], inline: true },
+                { name: ["Habituel"], value: [{ t: "code", text: "213,51€" }], inline: true },
+                { name: ["Remise"], value: [{ t: "code", text: "-86%" }], inline: true }
+            ],
+            footer: { text: "Test", timestamp: "Aujourd'hui" }
+        }] : undefined,
+        buttons: settings.store.showButtons ? [{ label: "Lien de test", style: 5, disabled: false, url: "https://vencord.dev" }] : undefined
+    });
+}
+
+bridge.sendTest = sendTest;
+
 // ── Plugin ─────────────────────────────────────────────────────────────────────
 
 export default definePlugin({
@@ -598,12 +666,12 @@ export default definePlugin({
             if (!decision || (!decision.show && !decision.sound)) return;
             remember(decisions, message.id, decision);
 
-            const visible = decision.show && await canShowNow(channel);
+            const { viewing, blocked } = await focusState(channel);
             // Discord's notification may have claimed it while we were checking the focus
-            if (visible && !tracked.has(message.id)) notify(message, decision);
+            if (decision.show && !viewing && !blocked && !tracked.has(message.id)) notify(message, decision);
 
             // Discord stays silent about what it would not have notified: play the sound ourselves, unless it did after all
-            if (decision.sound && !decision.discordWould && (visible || !decision.show) && !discordHandled.has(message.id)) {
+            if (decision.sound && !decision.discordWould && !viewing && !discordHandled.has(message.id)) {
                 soundTimers.set(message.id, setTimeout(() => {
                     soundTimers.delete(message.id);
                     if (!discordHandled.has(message.id)) playSound();
@@ -623,6 +691,7 @@ export default definePlugin({
 
     start() {
         running = true;
+        migrateSettings();
         const pruned = pruneExpired(settings.store.rules);
         if (pruned) settings.store.rules = pruned;
         actionLoop();
@@ -651,36 +720,5 @@ export default definePlugin({
         displayed.add(data.id);
         show({ id: data.id, title: data.title, subtitle: data.subtitle, icon: data.icon, preview: data.text, content: [data.text], priority: data.priority });
         return true;
-    },
-
-    settingsAboutComponent: () => (
-        <Button onClick={() => {
-            // A new id each time, to try the stacking with several clicks
-            const id = `test-${Date.now()}`;
-            displayed.add(id);
-            show({
-                id,
-                title: "Notification de test",
-                subtitle: "BetterNotifications",
-                icon: "https://cdn.discordapp.com/embed/avatars/0.png",
-                preview: "Si tu vois ceci par-dessus ton jeu, ça fonctionne !",
-                content: ["Si tu vois ceci par-dessus ton jeu, ", { t: "b", c: ["ça fonctionne"] }, " !"],
-                embeds: settings.store.fullEmbeds ? [{
-                    color: "#5865f2",
-                    title: ["Exemple d'embed"],
-                    url: "https://vencord.dev",
-                    description: ["Survole la carte pour mettre le compte à rebours en pause, ", { t: "code", text: "clique" }, " pour aller au message, clic droit pour les options."],
-                    fields: [
-                        { name: ["Prix"], value: [{ t: "code", text: "29,38€" }], inline: true },
-                        { name: ["Habituel"], value: [{ t: "code", text: "213,51€" }], inline: true },
-                        { name: ["Remise"], value: [{ t: "code", text: "-86%" }], inline: true }
-                    ],
-                    footer: { text: "Test", timestamp: "Aujourd'hui" }
-                }] : undefined,
-                buttons: settings.store.showButtons ? [{ label: "Lien de test", style: 5, disabled: false, url: "https://vencord.dev" }] : undefined
-            });
-        }}>
-            Envoyer une notification de test
-        </Button>
-    )
+    }
 });

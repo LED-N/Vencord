@@ -8,65 +8,73 @@ import type { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import type { Channel, Guild, User } from "@vencord/discord-types";
 import { Menu } from "@webpack/common";
 
-import { Rule, RuleKind, Rules, ShowRule, SoundRule, withRule } from "./rules";
+import { clock, inheritedLabels, snoozeEnd, summaryFor } from "./effective";
+import { NOTIFY_LABELS, RULE_NOTIFY, RULE_SOUND, SOUND_LABELS } from "./labels";
+import { Rule, RuleKind, Rules, withoutRules, withRule } from "./rules";
 import { settings } from "./settings";
+import { openSettings } from "./ui/SettingsModal";
 
-const SHOW_OPTIONS: [ShowRule | undefined, string][] = [
-    [undefined, "Par défaut"],
-    ["always", "Toujours (même si muté)"],
-    ["mentions", "Mentions seulement"],
-    ["never", "Jamais"]
-];
-const SOUND_OPTIONS: [SoundRule | undefined, string][] = [[undefined, "Par défaut"], ["on", "Activé"], ["off", "Coupé"]];
 const SNOOZES: [number, string][] = [[15, "15 minutes"], [60, "1 heure"], [8 * 60, "8 heures"], [24 * 60, "24 heures"]];
 
 /**
  * Patches run while the context menu renders, so this hook makes the menu re-render as soon as a rule changes:
  * without it, the new check mark only showed up once the mouse moved to another row.
  * Called unconditionally at the top of every patch, to keep the hook order stable.
+ * The source settings are listened to as well, since the inherited values shown depend on them.
  */
-const useRules = () => settings.use(["rules"]).rules;
+const useRules = () => settings.use(["rules", "serversNotify", "serversSound", "dmsNotify", "dmsSound", "groupsNotify", "groupsSound"]).rules;
 
 function ruleMenu(rules: Rules, id: string, kind: RuleKind) {
     const rule: Rule | undefined = rules[id];
-    const set = (patch: Partial<Rule>) => settings.store.rules = withRule(settings.store.rules, id, kind, patch);
-    const snoozed = !!rule?.snoozedUntil && rule.snoozedUntil > Date.now();
+    // Like in the settings window, an exception only goes away with "Remove": going back to the defaults keeps it listed.
+    // Nothing is created either for a change that leaves it empty
+    const set = (patch: Partial<Rule>) => {
+        const { rules } = settings.store;
+        settings.store.rules = withRule(rules, id, kind, patch, !!rules[id]);
+    };
+    const snoozed = snoozeEnd(rule);
+    const inherited = inheritedLabels(id, kind, rules);
+    const notifyLabel = rule?.notify ? NOTIFY_LABELS[rule.notify] : inherited.notify;
+    const soundLabel = rule?.sound ? SOUND_LABELS[rule.sound] : inherited.sound;
 
     return (
         <Menu.MenuGroup key="vc-bn">
             <Menu.MenuItem id="vc-bn" label="BetterNotifications">
-                <Menu.MenuGroup label="Affichage">
-                    {SHOW_OPTIONS.map(([value, label]) => (
-                        <Menu.MenuRadioItem
-                            key={label}
-                            group="vc-bn-show"
-                            id={`vc-bn-show-${value ?? "default"}`}
-                            label={label}
-                            checked={rule?.show === value}
-                            action={() => set({ show: value })}
-                        />
-                    ))}
-                </Menu.MenuGroup>
-                <Menu.MenuGroup label="Son">
-                    {SOUND_OPTIONS.map(([value, label]) => (
-                        <Menu.MenuRadioItem
-                            key={label}
-                            group="vc-bn-sound"
-                            id={`vc-bn-sound-${value ?? "default"}`}
-                            label={label}
-                            checked={rule?.sound === value}
-                            action={() => set({ sound: value })}
-                        />
-                    ))}
+                <Menu.MenuGroup>
+                    <Menu.MenuItem id="vc-bn-status" label={summaryFor(id, kind, rules)} disabled />
                 </Menu.MenuGroup>
                 <Menu.MenuGroup>
+                    <Menu.MenuItem id="vc-bn-notify" label={`Notification : ${notifyLabel}`}>
+                        {RULE_NOTIFY.map(value => (
+                            <Menu.MenuRadioItem
+                                key={value ?? "default"}
+                                group="vc-bn-notify"
+                                id={`vc-bn-notify-${value ?? "default"}`}
+                                label={value ? NOTIFY_LABELS[value] : inherited.notify}
+                                checked={rule?.notify === value}
+                                action={() => set({ notify: value })}
+                            />
+                        ))}
+                    </Menu.MenuItem>
+                    <Menu.MenuItem id="vc-bn-sound" label={`Son : ${soundLabel}`}>
+                        {RULE_SOUND.map(value => (
+                            <Menu.MenuRadioItem
+                                key={value ?? "default"}
+                                group="vc-bn-sound"
+                                id={`vc-bn-sound-${value ?? "default"}`}
+                                label={value ? SOUND_LABELS[value] : inherited.sound}
+                                checked={rule?.sound === value}
+                                action={() => set({ sound: value })}
+                            />
+                        ))}
+                    </Menu.MenuItem>
                     <Menu.MenuCheckboxItem
                         id="vc-bn-priority"
-                        label="Prioritaire (reste affichée)"
+                        label="★ Prioritaire"
                         checked={!!rule?.priority}
                         action={() => set({ priority: rule?.priority ? undefined : true })}
                     />
-                    <Menu.MenuItem id="vc-bn-snooze" label={snoozed ? "Silence en cours" : "Silence temporaire"}>
+                    <Menu.MenuItem id="vc-bn-snooze" label={snoozed ? `Silence jusqu'à ${clock(snoozed)}` : "Silence temporaire"}>
                         {snoozed && <Menu.MenuItem id="vc-bn-snooze-off" label="Lever le silence" action={() => set({ snoozedUntil: undefined })} />}
                         {SNOOZES.map(([minutes, label]) => (
                             <Menu.MenuItem
@@ -77,6 +85,26 @@ function ruleMenu(rules: Rules, id: string, kind: RuleKind) {
                             />
                         ))}
                     </Menu.MenuItem>
+                </Menu.MenuGroup>
+                <Menu.MenuGroup>
+                    <Menu.MenuItem
+                        id="vc-bn-open"
+                        label="Modifier dans les réglages…"
+                        action={() => {
+                            // Listed even before anything is set, so the window can open on it
+                            const { rules } = settings.store;
+                            if (!rules[id]) settings.store.rules = withRule(rules, id, kind, {}, true);
+                            openSettings("exceptions", id);
+                        }}
+                    />
+                    {rule && (
+                        <Menu.MenuItem
+                            id="vc-bn-remove"
+                            label="Retirer l'exception"
+                            color="danger"
+                            action={() => settings.store.rules = withoutRules(settings.store.rules, [id])}
+                        />
+                    )}
                 </Menu.MenuGroup>
             </Menu.MenuItem>
         </Menu.MenuGroup>
