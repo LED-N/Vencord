@@ -693,7 +693,9 @@ async function runDesktop(ctx: EngineContext, job: QuestJob, quest: any, taskNam
         pid,
         pidPath: [pid],
         processName: applicationName,
-        start: Date.now()
+        start: Date.now(),
+        // BetterNotifications must not take it for a game being played
+        vcQuestFake: true
     };
 
     // Games Discord is already tracking, including those started during the quest, stay visible

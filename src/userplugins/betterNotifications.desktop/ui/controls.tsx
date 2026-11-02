@@ -253,20 +253,31 @@ export function Avatar({ src, name, glyph, size = 32 }: { src?: string; name: st
 }
 
 /** Searchable list: picking an entry adds an exception for it */
-export function Picker({ label, choices, onPick, variant = "primary" }: { label: string; choices: () => Choice[]; onPick(id: string): void; variant?: "primary" | "subtle"; }) {
+export function Picker({ label, choices, onPick, variant = "primary", initialQuery = "", limit, empty = "Tout est déjà dans la liste." }: {
+    label: string;
+    choices: () => Choice[];
+    onPick(id: string): void;
+    variant?: "primary" | "subtle";
+    initialQuery?: string;
+    /** Entries drawn at most, for very long lists */
+    limit?: number;
+    /** Shown when there is nothing to pick at all */
+    empty?: string;
+}) {
     const [open, setOpen] = useState(false);
-    const [query, setQuery] = useState("");
+    const [query, setQuery] = useState(initialQuery);
     const ref = useRef<HTMLDivElement>(null);
     const close = () => {
         setOpen(false);
-        setQuery("");
+        setQuery(initialQuery);
     };
     const up = useFloating(ref, open, close, 340);
 
-    // Only built while the list is open: some accounts have hundreds of friends
-    const all = useMemo(() => open ? choices() : [], [open]);
+    // Only built while the list is open: some accounts have hundreds of friends. Rebuilt when the owner hands new choices
+    const all = useMemo(() => open ? choices() : [], [open, choices]);
     const needle = query.trim().toLocaleLowerCase();
-    const shown = needle ? all.filter(c => `${c.name} ${c.sub ?? ""}`.toLocaleLowerCase().includes(needle)) : all;
+    const matches = needle ? all.filter(c => `${c.name} ${c.sub ?? ""}`.toLocaleLowerCase().includes(needle)) : all;
+    const shown = limit ? matches.slice(0, limit) : matches;
 
     const pick = (id: string) => {
         onPick(id);
@@ -305,7 +316,7 @@ export function Picker({ label, choices, onPick, variant = "primary" }: { label:
                                 {choice.sub && <span className="vc-bn-option-hint">{choice.sub}</span>}
                             </button>
                         ))}
-                        {!shown.length && <div className="vc-bn-empty-small">{all.length ? "Aucun résultat." : "Tout est déjà dans la liste."}</div>}
+                        {!shown.length && <div className="vc-bn-empty-small">{all.length ? "Aucun résultat." : empty}</div>}
                     </div>
                 </div>
             )}

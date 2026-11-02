@@ -9,10 +9,11 @@ import type { RenderModalProps } from "@vencord/discord-types";
 import { ChannelStore, Modal, openModal, useEffect, useRef, useState } from "@webpack/common";
 
 import { settings } from "../settings";
-import type { OverlayPosition } from "../types";
+import type { OverlayMonitor, OverlayPosition } from "../types";
 import { bridge } from "./bridge";
-import { Card, cl, Row, Section, SettingRow } from "./controls";
+import { Card, cl, Dropdown, Row, Section, SettingRow } from "./controls";
 import { ExceptionsTab, groupRules } from "./Exceptions";
+import { GameDetection } from "./Games";
 import { Icon, IconName } from "./icons";
 import { ReceptionTab } from "./Reception";
 
@@ -144,11 +145,11 @@ function acceleratorKey(e: KeyboardEvent) {
     return NAMED_KEYS[code] ?? null;
 }
 
-function ShortcutInput() {
-    const { shortcut } = settings.use(["shortcut"]);
+function ShortcutInput({ k }: { k: "shortcut" | "unlockShortcut"; }) {
+    const shortcut = settings.use([k])[k];
     const [recording, setRecording] = useState(false);
     const [error, setError] = useState("");
-    const keys = shortcut.split("+").map(k => k.trim()).filter(Boolean);
+    const keys = shortcut.split("+").map(part => part.trim()).filter(Boolean);
 
     useEffect(() => {
         if (!recording) return;
@@ -169,13 +170,13 @@ function ShortcutInput() {
                 return;
             }
 
-            settings.store.shortcut = [...modifiers, key].join("+");
+            settings.store[k] = [...modifiers, key].join("+");
             setError("");
             setRecording(false);
         };
         window.addEventListener("keydown", onKey, true);
         return () => window.removeEventListener("keydown", onKey, true);
-    }, [recording]);
+    }, [recording, k]);
 
     return (
         <div className="vc-bn-shortcut">
@@ -190,40 +191,100 @@ function ShortcutInput() {
             >
                 {recording
                     ? "Appuie sur la combinaison…"
-                    : keys.length ? keys.map(k => <kbd key={k}>{k}</kbd>) : <span className="vc-bn-muted">Aucun</span>}
+                    : keys.length ? keys.map(part => <kbd key={part}>{part}</kbd>) : <span className="vc-bn-muted">Aucun</span>}
             </button>
             {shortcut && !recording && (
-                <button type="button" className="vc-bn-btn vc-bn-btn-ghost" onClick={() => settings.store.shortcut = ""}>Désactiver</button>
+                <button type="button" className="vc-bn-btn vc-bn-btn-ghost" onClick={() => settings.store[k] = ""}>Désactiver</button>
             )}
             {error && <div className="vc-bn-error">{error}</div>}
         </div>
     );
 }
 
-function GameTab() {
+function GameDisplayPicker() {
+    const { gameDisplay } = settings.use(["gameDisplay"]);
+    const [displays, setDisplays] = useState<OverlayMonitor[] | null>(null);
+    const [error, setError] = useState(false);
+
+    useEffect(() => {
+        let cancelled = false;
+        const refresh = () => bridge.getDisplays().then(value => {
+            if (cancelled) return;
+            setDisplays(value);
+            setError(false);
+        }).catch(() => {
+            if (!cancelled) setError(true);
+        });
+        refresh();
+        const timer = setInterval(refresh, 2000);
+        return () => {
+            cancelled = true;
+            clearInterval(timer);
+        };
+    }, []);
+
+    const options = [
+        { value: "", label: "Réglage habituel", hint: "Écran choisi dans Apparence" },
+        ...(displays ?? []).map((d, i) => ({
+            value: d.id,
+            label: `Écran ${i + 1}${d.label ? ` · ${d.label}` : ""}${d.primary ? " (principal)" : ""}`,
+            hint: `${d.width} × ${d.height}`
+        }))
+    ];
+    if (gameDisplay && !displays?.some(d => d.id === gameDisplay)) options.push({
+        value: gameDisplay,
+        label: displays ? "Écran déconnecté" : "Écran enregistré",
+        hint: "Réglage habituel utilisé tant que cet écran est indisponible"
+    });
+
+    return (
+        <Row title="Écran des notifications en jeu" hint={<>
+            {settings.def.gameDisplay.description}
+            {error ? <><br />Impossible de lire les écrans. Nouvelle tentative automatique…</>
+                : displays == null ? <><br />Recherche des écrans…</>
+                    : displays.length < 2 && <><br />Un seul écran détecté.</>}
+        </>}>
+            <Dropdown label="Écran des notifications en jeu" options={options} value={gameDisplay} onChange={value => settings.store.gameDisplay = value} />
+        </Row>
+    );
+}
+
+function GameTab({ onClose }: { onClose(): void; }) {
     const { clickable, typing } = settings.use(["clickable", "typing"]);
 
     return (
         <>
+            <GameDetection onClose={onClose} />
+
+            <Section title="Écran en jeu" description="Sur un autre écran que le jeu, les notifications restent visibles et accessibles. Sur le même écran, tes réglages d'estompage et de verrouillage s'appliquent.">
+                <Card>
+                    <GameDisplayPicker />
+                </Card>
+            </Section>
+
             <Section title="Souris">
                 <Card>
                     <SettingRow k="clickable" title="Cartes cliquables" />
                     <SettingRow k="hover" title="Au survol" disabled={!clickable} />
+                    <SettingRow k="lockInGame" title="Verrouiller en jeu" disabled={!clickable} />
                 </Card>
             </Section>
 
-            <Section title="Pendant que tu joues" description="Les cartes s'effacent pour ne pas gêner. Approcher la souris d'une carte l'affiche normalement.">
+            <Section title="Pendant que tu joues" description="Sur l'écran du jeu, les cartes suivent le comportement choisi ci-dessous. Alt+Tab vers une autre application ou le menu Démarrer permet de les retrouver.">
                 <Card>
-                    <SettingRow k="typing" title="Quand tu es actif ailleurs" />
+                    <SettingRow k="typing" title="En jeu ou actif ailleurs" />
                     {typing !== "off" && <SettingRow k="typingTrigger" title="Déclencheur" />}
                     {typing === "fade" && <SettingRow k="typingOpacity" title="Opacité estompée" step={5} format={pct} />}
                 </Card>
             </Section>
 
-            <Section title="Raccourci clavier">
+            <Section title="Raccourcis clavier">
                 <Card>
                     <Row title="Fermer toutes les notifications" hint={settings.def.shortcut.description}>
-                        <ShortcutInput />
+                        <ShortcutInput k="shortcut" />
+                    </Row>
+                    <Row title="Déverrouiller les notifications" hint={settings.def.unlockShortcut.description}>
+                        <ShortcutInput k="unlockShortcut" />
                     </Row>
                 </Card>
             </Section>
@@ -286,7 +347,7 @@ function SettingsModal({ initialTab, focusId, ...props }: RenderModalProps & { i
                             {tab === "exceptions" && <ExceptionsTab focusId={focus} />}
                             {tab === "appearance" && <AppearanceTab />}
                             {tab === "content" && <ContentTab />}
-                            {tab === "game" && <GameTab />}
+                            {tab === "game" && <GameTab onClose={props.onClose} />}
                         </ErrorBoundary>
                     </div>
                 </div>

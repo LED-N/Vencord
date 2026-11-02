@@ -11,11 +11,12 @@ import type { Channel } from "@vencord/discord-types";
 import { findByCodeLazy, waitFor } from "@webpack";
 import {
     ApplicationStreamingStore, AuthenticationStore, ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, NavigationRouter,
-    PresenceStore, ReadStateStore, RelationshipStore, RestAPI, SelectedChannelStore, showToast, SnowflakeUtils, StreamerModeStore,
-    UserGuildSettingsStore, UserStore, WindowStore
+    NotificationSettingsStore, PresenceStore, ReadStateStore, RelationshipStore, RestAPI, RunningGameStore, SelectedChannelStore, showToast, SnowflakeUtils,
+    StreamerModeStore, UserGuildSettingsStore, UserStore, WindowStore
 } from "@webpack/common";
 
 import { collectButtons, convertButton, convertEmbed, FormatOptions, imageAttachments, plainText, RawAuthor, RawComponent, RawMessage, toRich } from "./format";
+import { detectedGames } from "./games";
 import { contextMenus } from "./menus";
 import { Level, matchesKeyword, MentionKind, migrateRules, pruneExpired, resolve, Rule, RuleKind, scopeChain, SoundLevel, sourceOf, withRule } from "./rules";
 import { settings, sourceDefaults } from "./settings";
@@ -48,7 +49,7 @@ interface Decision {
     show: boolean;
     sound: boolean;
     priority: boolean;
-    /** Discord would have notified on its own, and so plays the sound itself */
+    /** Discord would have notified on its own */
     discordWould: boolean;
     /** Discord's own desktop notification must be skipped */
     suppressNative: boolean;
@@ -91,6 +92,7 @@ function layout(): OverlayLayout {
     return {
         position: s.position as OverlayPosition,
         display: s.display as OverlayDisplay,
+        gameDisplay: s.gameDisplay,
         offsetX: Math.round(s.offsetX),
         offsetY: Math.round(s.offsetY),
         maxWidth: s.maxWidth,
@@ -105,7 +107,9 @@ function layout(): OverlayLayout {
         typing: s.typing as TypingBehavior,
         typingTrigger: s.typingTrigger as TypingTrigger,
         typingOpacity: s.typingOpacity / 100,
-        shortcut: s.shortcut.trim()
+        lockInGame: s.lockInGame,
+        shortcut: s.shortcut.trim(),
+        unlockShortcut: s.unlockShortcut.trim()
     };
 }
 
@@ -331,6 +335,13 @@ function playSound() {
     NotificationUtils?.playNotificationSound(DEFAULT_SOUND, 1);
 }
 
+/** With desktop notifications turned off, Discord plays the sound of what it notifies without making a notification */
+function discordPlaysSoundAlone(decision: Decision) {
+    return decision.discordWould
+        && NotificationSettingsStore.getDesktopType() === "NEVER"
+        && !NotificationSettingsStore.isSoundDisabled(DEFAULT_SOUND);
+}
+
 // ── Discord's notifications ────────────────────────────────────────────────────
 
 interface NotificationOptions {
@@ -434,12 +445,15 @@ function installHook(utils: NotificationUtilsModule) {
     utils.showNotification = function (this: unknown, icon, title, body, trackingProps, options) {
         try {
             const decision = onDiscordNotification(body, options);
-            if (decision?.suppressNative) {
-                // Discord plays the sound from inside showNotification, keep it if the rules allow it
-                if (decision.sound && options?.sound != null) utils.playNotificationSound(options.sound, options.volume ?? 1, options.soundpack);
-                return Promise.resolve(undefined);
+            if (decision) {
+                // Discord plays the sound from inside showNotification, and passes none when its message sound is turned off:
+                // the rules have the last word either way
+                const discordPlays = !decision.suppressNative && options?.sound != null;
+                if (decision.sound && !discordPlays)
+                    utils.playNotificationSound(options?.sound ?? DEFAULT_SOUND, options?.volume ?? 1, options?.soundpack);
+                if (decision.suppressNative) return Promise.resolve(undefined);
+                if (!decision.sound && options?.sound != null) options = { ...options, sound: undefined };
             }
-            if (decision && !decision.sound && options?.sound != null) options = { ...options, sound: undefined };
         } catch (e) {
             logger.error("Failed to handle Discord notification", e);
         }
@@ -574,6 +588,35 @@ async function actionLoop() {
     }
 }
 
+// ── Games ──────────────────────────────────────────────────────────────────────
+
+let gameReported: string | null = null;
+
+/** Send real game process ids so the main process can distinguish playing from Alt+Tab and the Start menu */
+function syncGame() {
+    let pids: number[];
+    try {
+        pids = [...new Set(detectedGames()
+            .map(game => game.pid)
+            .filter((pid): pid is number => typeof pid === "number" && Number.isInteger(pid) && pid > 0))].sort((a, b) => a - b);
+    } catch (e) {
+        logger.error("Failed to read the running games", e);
+        return;
+    }
+
+    const key = pids.join(",");
+    if (key === gameReported) return;
+    gameReported = key;
+    Native.setRunningGames(pids).catch(e => {
+        gameReported = null;
+        logger.error("Failed to report the running games", e);
+    });
+}
+
+function syncGameDisplay() {
+    Native.setGameDisplay(settings.store.gameDisplay).catch(e => logger.error("Failed to change the game display", e));
+}
+
 // ── Settings migration ─────────────────────────────────────────────────────────
 
 /**
@@ -632,6 +675,7 @@ function sendTest() {
 }
 
 bridge.sendTest = sendTest;
+bridge.getDisplays = () => Native.getDisplays();
 
 // ── Plugin ─────────────────────────────────────────────────────────────────────
 
@@ -670,8 +714,9 @@ export default definePlugin({
             // Discord's notification may have claimed it while we were checking the focus
             if (decision.show && !viewing && !blocked && !tracked.has(message.id)) notify(message, decision);
 
-            // Discord stays silent about what it would not have notified: play the sound ourselves, unless it did after all
-            if (decision.sound && !decision.discordWould && !viewing && !discordHandled.has(message.id)) {
+            // Without a notification from Discord, nothing plays the sound: what it would not have notified, but also everything
+            // while its own in-game overlay is focused. Play it ourselves, unless its notification shows up after all
+            if (decision.sound && !viewing && !discordHandled.has(message.id) && !discordPlaysSoundAlone(decision)) {
                 soundTimers.set(message.id, setTimeout(() => {
                     soundTimers.delete(message.id);
                     if (!discordHandled.has(message.id)) playSound();
@@ -696,11 +741,17 @@ export default definePlugin({
         if (pruned) settings.store.rules = pruned;
         actionLoop();
         hookNotifications();
+        RunningGameStore.addChangeListener(syncGame);
+        SettingsStore.addChangeListener("plugins.BetterNotifications.gameDisplay", syncGameDisplay);
+        syncGame();
     },
 
     stop() {
         running = false;
         unhookNotifications();
+        RunningGameStore.removeChangeListener(syncGame);
+        SettingsStore.removeChangeListener("plugins.BetterNotifications.gameDisplay", syncGameDisplay);
+        gameReported = null;
         awaitingRaw.forEach(clearTimeout);
         awaitingRaw.clear();
         soundTimers.forEach(clearTimeout);

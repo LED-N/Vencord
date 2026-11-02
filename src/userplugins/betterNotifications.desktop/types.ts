@@ -57,10 +57,18 @@ export type OverlayPosition = "bottom-right" | "top-right" | "bottom-left" | "to
 /** Which monitor the overlay appears on */
 export type OverlayDisplay = "cursor" | "primary" | "discord";
 
+export interface OverlayMonitor {
+    id: string;
+    label: string;
+    primary: boolean;
+    width: number;
+    height: number;
+}
+
 /** What happens to the cards while the user types in another application */
 export type TypingBehavior = "off" | "fade" | "hide";
 
-/** "keyboard": typing with the mouse still; "any": any keyboard or mouse activity away from the cards (games) */
+/** Outside a detected game. "keyboard": typing with the mouse still; "any": any keyboard, mouse or controller activity away from the cards */
 export type TypingTrigger = "keyboard" | "any";
 
 /** "interact": hovering captures the mouse; "ghost": the card fades and lets clicks through until the cursor rests on it */
@@ -69,6 +77,8 @@ export type HoverBehavior = "interact" | "ghost";
 export interface OverlayLayout {
     position: OverlayPosition;
     display: OverlayDisplay;
+    /** Explicit display id while a detected game is running; empty keeps the usual display setting */
+    gameDisplay: string;
     /** Distance from the screen edges, in screen pixels */
     offsetX: number;
     offsetY: number;
@@ -92,8 +102,12 @@ export interface OverlayLayout {
     typingTrigger: TypingTrigger;
     /** Opacity of the cards while typing, 0 to 1 */
     typingOpacity: number;
+    /** While a game is in the foreground, the cards never capture the mouse until unlocked */
+    lockInGame: boolean;
     /** Electron accelerator closing every card while some are displayed, empty to disable */
     shortcut: string;
+    /** Electron accelerator making the cards clickable for a while, in game or past the ghost mode, empty to disable */
+    unlockShortcut: string;
 }
 
 export interface OverlayNotification {

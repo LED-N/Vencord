@@ -80,6 +80,11 @@
             opacity: 0;
         }
 
+        /* Unlock shortcut: the cards wait and take the mouse */
+        body.unlocked .n {
+            border-color: rgba(88, 101, 242, 0.8);
+        }
+
         .n {
             flex-shrink: 0;
             min-width: 200px;
@@ -204,6 +209,10 @@
             justify-content: center;
             font-size: 14px;
             line-height: 1;
+            padding: 0;
+            border: 0;
+            font-family: inherit;
+            cursor: pointer;
             color: var(--muted);
             background: rgba(0, 0, 0, 0.35);
             opacity: 0;
@@ -592,6 +601,8 @@
         /** Milliseconds after which the newest card shrinks to a line as well, 0 to never */
         let autoCollapse = 0;
         let typingMode = "off";
+        /** Unlock shortcut: every timer waits until the cards lock again */
+        let unlocked = false;
         /** Sequence number of the last push, echoed back so the main process ignores stale "empty" reports */
         let lastSeq = 0;
         let cssZoom = 1;
@@ -817,11 +828,23 @@
             if (n.preview) miniText.append(el("span", null, " · " + n.preview));
             mini.append(miniText);
 
-            const close = el("div", "x", "✕");
-            close.dataset.close = "";
-            close.title = "Fermer";
-
-            card.replaceChildren(close, full, mini);
+            let close = card.querySelector(":scope > [data-close]");
+            if (!close) {
+                close = el("button", "x", "✕");
+                close.type = "button";
+                close.dataset.close = "";
+                close.title = "Fermer";
+                close.setAttribute("aria-label", "Fermer la notification");
+                close.addEventListener("click", e => {
+                    e.stopPropagation();
+                    dismiss(card);
+                });
+                card.append(close, full, mini);
+            } else {
+                // A message update during a press must not replace the close button and lose its click/capture.
+                card.querySelector(":scope > .full").replaceWith(full);
+                card.querySelector(":scope > .mini").replaceWith(mini);
+            }
         }
 
         // ── Lifetime ──────────────────────────────────────────────────────────
@@ -842,7 +865,7 @@
         }
 
         function resumeTimer(card) {
-            if (card._paused && !card._gone) startTimer(card);
+            if (card._paused && !card._gone && !unlocked) startTimer(card);
         }
 
         /** Restarts the display time, used when a newer message of the same conversation takes the card over */
@@ -921,6 +944,7 @@
 
         /** Called by the main process when the cursor left the cards, in case the page missed mouseleave */
         window.pointerLeft = () => {
+            releasePointer();
             clearTimeout(expandTimer);
             closeMenu();
             // The main process keeps the mouse during a real swipe, so a drag still pending here lost its release
@@ -934,7 +958,31 @@
 
         // ── Swipe to dismiss ──────────────────────────────────────────────────
 
+        let pressedPointer = null;
         let drag = null;
+
+        function releasePointer(e) {
+            if (!pressedPointer || (e && e.pointerId !== pressedPointer.id)) return;
+            const { target, id } = pressedPointer;
+            pressedPointer = null;
+            send({ type: "pointer", active: false });
+            if (target.hasPointerCapture(id)) target.releasePointerCapture(id);
+        }
+
+        document.addEventListener("pointerdown", e => {
+            if (e.button !== 0 || !e.target.closest(".n, .menu, .more")) return;
+            pressedPointer = { target: e.target, id: e.pointerId };
+            // Keep both the DOM target and the native window receiving the whole press, including the close button.
+            e.target.setPointerCapture(e.pointerId);
+            send({ type: "pointer", active: true });
+        }, true);
+        document.addEventListener("pointerup", releasePointer, true);
+        document.addEventListener("pointercancel", releasePointer, true);
+        document.addEventListener("lostpointercapture", e => {
+            if (!pressedPointer || e.pointerId !== pressedPointer.id) return;
+            releasePointer(e);
+            cancelDrag();
+        });
 
         function onPointerDown(card, e) {
             if (e.button !== 0 || e.target.closest("[data-close]")) return;
@@ -955,6 +1003,7 @@
         }
 
         document.addEventListener("pointermove", e => {
+            if (pressedPointer && e.pointerId === pressedPointer.id && !(e.buttons & 1)) releasePointer(e);
             if (!drag || e.pointerId !== drag.pointerId) return;
 
             // The release can happen while the window ignores the mouse (cursor next to the card): without this check,
@@ -968,7 +1017,6 @@
             if (!drag.moved) {
                 if (Math.abs(dx) < 6) return;
                 drag.moved = true;
-                drag.card.setPointerCapture(drag.pointerId);
                 drag.card.classList.add("dragging");
                 // Keep the window capturing the mouse even when the card leaves its hit box
                 send({ type: "drag", active: true });
@@ -1000,7 +1048,7 @@
         }
 
         document.addEventListener("pointerup", endDrag);
-        document.addEventListener("pointercancel", endDrag);
+        document.addEventListener("pointercancel", cancelDrag);
 
         // ── Clicks ────────────────────────────────────────────────────────────
 
@@ -1131,8 +1179,10 @@
             root.append(card);
             resizeObserver.observe(card);
             startTimer(card);
+            if (unlocked) pauseTimer(card);
             scheduleAutoCollapse(card);
             refreshExpanded();
+            watchPads();
         };
 
         /** Global shortcut */
@@ -1155,6 +1205,51 @@
             document.body.classList.remove("typing-fade", "typing-hide");
             if (active && typingMode !== "off") document.body.classList.add("typing-" + typingMode);
         };
+
+        window.setUnlocked = value => {
+            if (value === unlocked) return;
+            unlocked = value;
+            document.body.classList.toggle("unlocked", value);
+            if (value) liveCards().forEach(pauseTimer);
+            else liveCards().forEach(c => c !== hovered && resumeTimer(c));
+        };
+
+        // ── Controller activity ───────────────────────────────────────────────
+
+        /** Controller input is invisible to the system idle time the main process reads: polled here while cards are shown */
+        const PAD_POLL = 250;
+        /** Reports are throttled, the main process keeps each one for a second (PAD_ACTIVE) */
+        const PAD_REPORT = 500;
+        /** Stick deflection below this counts as resting (worn sticks drift) */
+        const PAD_DEADZONE = 0.3;
+        let padTimer = null;
+        let lastPadReport = 0;
+
+        function padActive(pad) {
+            return pad.buttons.some(b => b.pressed || b.value > 0.2) || pad.axes.some(a => Math.abs(a) > PAD_DEADZONE);
+        }
+
+        function pollPads() {
+            if (!liveCards().length) {
+                clearInterval(padTimer);
+                padTimer = null;
+                return;
+            }
+
+            let pads = [];
+            try {
+                pads = [...(navigator.getGamepads?.() || [])];
+            } catch { }
+
+            const now = Date.now();
+            if (now - lastPadReport < PAD_REPORT || !pads.some(p => p && p.connected && padActive(p))) return;
+            lastPadReport = now;
+            send({ type: "pad" });
+        }
+
+        function watchPads() {
+            padTimer ??= setInterval(pollPads, PAD_POLL);
+        }
 
         // ── "+N" counter ──────────────────────────────────────────────────────
 
@@ -1248,6 +1343,7 @@
                 reportedBoxes = boxes;
                 send({
                     type: "rects",
+                    viewport: { width: window.innerWidth, height: window.innerHeight },
                     rects: boxes.map(c => {
                         const r = c.getBoundingClientRect();
                         return [r.left - HIT_SLOP, r.top - HIT_SLOP, r.right + HIT_SLOP, r.bottom + HIT_SLOP].map(v => v * rectFactor);
@@ -1258,6 +1354,7 @@
 
         const resizeObserver = new ResizeObserver(layoutChanged);
         resizeObserver.observe(root);
+        window.addEventListener("resize", layoutChanged);
         root.addEventListener("transitionend", layoutChanged);
         root.addEventListener("animationend", layoutChanged);
     </script>

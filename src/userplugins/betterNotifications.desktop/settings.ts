@@ -186,6 +186,12 @@ export const settings = definePluginSettings({
     },
 
     // ── Staying out of the way ────────────────────────────────────────────────
+    gameDisplay: {
+        type: OptionType.STRING,
+        description: "Pendant un jeu détecté, utilise cet écran. Sur un écran différent de celui du jeu, les cartes ne sont ni estompées ni masquées. Si l'écran est débranché, le réglage habituel reprend",
+        default: "",
+        hidden: true
+    },
     clickable: {
         type: OptionType.BOOLEAN,
         description: "Ouvrir le message, liens, boutons, clic droit. Désactivé : la souris les traverse toujours",
@@ -203,7 +209,7 @@ export const settings = definePluginSettings({
     },
     typing: {
         type: OptionType.SELECT,
-        description: "Pendant que tu joues ou écris dans une autre application. Approcher la souris d'une carte l'affiche normalement",
+        description: "Pendant un jeu détecté par Discord, quelle que soit la manette ou le clavier, et quand tu écris dans une autre application",
         hidden: true,
         options: [
             { label: "Ne rien faire", value: "off" },
@@ -213,12 +219,18 @@ export const settings = definePluginSettings({
     },
     typingTrigger: {
         type: OptionType.SELECT,
-        description: "Ce qui compte comme de l'activité",
+        description: "Hors des jeux détectés, ce qui compte comme de l'activité",
         hidden: true,
         options: [
-            { label: "Clavier et souris (jeux)", value: "any", default: true },
+            { label: "Clavier, souris et manette", value: "any", default: true },
             { label: "Frappe au clavier seulement", value: "keyboard" }
         ]
+    },
+    lockInGame: {
+        type: OptionType.BOOLEAN,
+        description: "Sur l'écran du jeu au premier plan, la souris traverse les cartes pour éviter les clics accidentels. Alt+Tab vers une autre application ou la touche Windows permet de les utiliser ; revenir au jeu les verrouille de nouveau",
+        default: true,
+        hidden: true
     },
     typingOpacity: {
         type: OptionType.SLIDER,
@@ -232,6 +244,12 @@ export const settings = definePluginSettings({
         type: OptionType.STRING,
         description: "Raccourci global qui ferme toutes les cartes, actif seulement pendant qu'elles sont affichées",
         default: "Alt+Shift+N",
+        hidden: true
+    },
+    unlockShortcut: {
+        type: OptionType.STRING,
+        description: "Rend les cartes cliquables et met leur compte à rebours en pause, en jeu comme en mode fantôme. Elles se verrouillent de nouveau quelques secondes après que la souris les a quittées",
+        default: "Alt+Shift+U",
         hidden: true
     },
 

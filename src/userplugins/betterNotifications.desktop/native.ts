@@ -4,10 +4,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { BrowserWindow, globalShortcut, IpcMainInvokeEvent, powerMonitor, screen, shell } from "electron";
+import { app, BrowserWindow, globalShortcut, IpcMainInvokeEvent, powerMonitor, screen, shell } from "electron";
 import PAGE from "file://overlay.html";
 
-import type { OverlayAction, OverlayLayout, OverlayNotification } from "./types";
+import type { OverlayAction, OverlayLayout, OverlayMonitor, OverlayNotification } from "./types";
+import { ForegroundWindow, watchForeground } from "./windowsForeground";
 
 /** Must match the inset of #root in overlay.html */
 const PAGE_MARGIN = 12;
@@ -30,15 +31,21 @@ const TYPING_STILL = 1100;
 const NEAR_CARD = 80;
 /** The hidden window is destroyed after this long without notifications, to free its renderer process */
 const IDLE_DESTROY = 10 * 60_000;
+/** Controller input counts as activity for this long, the page reports it at most every PAD_REPORT ms (overlay.html) */
+const PAD_ACTIVE = 1000;
+/** Unlocked cards lock again once the cursor has stayed away from them this long */
+const UNLOCK_IDLE = 6000;
 
 type Rect = [left: number, top: number, right: number, bottom: number];
 
 type PageMessage =
-    | { type: "rects"; rects: Rect[]; }
+    | { type: "rects"; rects: Rect[]; viewport?: { width: number; height: number; }; }
     | { type: "empty"; seq: number; }
     | { type: "link"; url: string; }
     | { type: "drag"; active: boolean; }
+    | { type: "pointer"; active: boolean; }
     | { type: "focus"; }
+    | { type: "pad"; }
     | { type: "action"; action: OverlayAction; };
 
 let win: BrowserWindow | null = null;
@@ -49,9 +56,15 @@ let tickTimer: NodeJS.Timeout | null = null;
 let idleTimer: NodeJS.Timeout | null = null;
 let lastReassert = 0;
 let cardRects: Rect[] = [];
+/** The viewport measured in the same animation frame as the card rects, before native/CSS zoom conversion */
+let pageViewport: { width: number; height: number; } | null = null;
 let interactive = false;
+/** On Windows, permitted clicks need a normally activatable window, including after hide/showInactive reuse. */
+let focusable = false;
 /** A card is being swiped: keep capturing the mouse even outside the hit boxes */
 let dragging = false;
+/** Keep a press on a card/control intact, including before a swipe reaches its movement threshold */
+let pointerDown = false;
 let layout: OverlayLayout | null = null;
 /** Zoom applied through webContents: card rects are in CSS pixels and must be multiplied by it. 1 when the page zooms itself */
 let nativeZoom = 1;
@@ -66,8 +79,24 @@ let typing = false;
 let lastCursor: Electron.Point | null = null;
 let lastMoveAt = 0;
 let lastTypingCheck = 0;
+/** Last controller input seen by the page */
+let lastPadAt = 0;
 
-let shortcut: string | null = null;
+/** Only actual game process ids, excluding launchers and Quest Completer's synthetic games */
+let gamePids = new Set<number>();
+let foreground: ForegroundWindow | null = null;
+let foregroundAt = 0;
+let stopForeground: (() => void) | null = null;
+/** Remember the game's monitor across Alt+Tab; moving the cursor must not change it */
+let gameDisplayId: number | null = null;
+let placedDisplayId: number | null = null;
+/** The unlock shortcut made the cards clickable, until unlockedUntil */
+let unlocked = false;
+let unlockedUntil = 0;
+
+/** Accelerators asked for by the layout, and those actually registered (the others belong to another application) */
+let shortcutKey: string | null = null;
+let registered: string[] = [];
 
 const pendingActions: OverlayAction[] = [];
 let actionWaiter: ((action: OverlayAction | null) => void) | null = null;
@@ -91,7 +120,7 @@ function getWindow() {
         minimizable: false,
         maximizable: false,
         fullscreenable: false,
-        // Clicking a card never takes the focus away from the game
+        // Showing the overlay never activates it; permitted clicks can enable activation below.
         focusable: false,
         skipTaskbar: true,
         hasShadow: false,
@@ -108,6 +137,7 @@ function getWindow() {
 
     win.setIgnoreMouseEvents(true);
     interactive = false;
+    focusable = false;
     // On Windows, levels from "pop-up-menu" upward are also placed above the taskbar
     win.setAlwaysOnTop(true, "screen-saver");
 
@@ -131,9 +161,16 @@ function getWindow() {
         win = null;
         ready = null;
         layout = null;
+        pageViewport = null;
         stopTicking();
-        unregisterShortcut();
+        unregisterShortcuts();
+        screen.removeListener("display-added", refreshPlacement);
+        screen.removeListener("display-removed", refreshPlacement);
+        screen.removeListener("display-metrics-changed", refreshPlacement);
     });
+    screen.on("display-added", refreshPlacement);
+    screen.on("display-removed", refreshPlacement);
+    screen.on("display-metrics-changed", refreshPlacement);
 
     ready = win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(PAGE)).then(() => { });
 
@@ -144,6 +181,8 @@ function handlePageMessage(msg: PageMessage) {
     switch (msg.type) {
         case "rects":
             cardRects = msg.rects;
+            pageViewport = msg.viewport && Number.isFinite(msg.viewport.width) && Number.isFinite(msg.viewport.height)
+                && msg.viewport.width > 0 && msg.viewport.height > 0 ? msg.viewport : null;
             break;
         case "empty":
             // Resizing the window when showing it triggers a layout report before the card arrives
@@ -155,8 +194,14 @@ function handlePageMessage(msg: PageMessage) {
         case "drag":
             dragging = msg.active;
             break;
+        case "pointer":
+            pointerDown = msg.active && interactive && !!layout?.clickable && !isLocked();
+            break;
         case "focus":
             focusDiscord();
+            break;
+        case "pad":
+            lastPadAt = Date.now();
             break;
         case "action":
             // Opening the message brings Discord forward, menu entries and closings act in the background
@@ -202,6 +247,16 @@ function setInteractive(value: boolean) {
     if (!value) run("window.pointerLeft?.()");
 }
 
+function syncFocusable() {
+    if (process.platform !== "win32" || !win || win.isDestroyed()) return;
+    const allowed = !!layout?.clickable && !isLocked();
+    if (allowed === focusable) return;
+    focusable = allowed;
+    // A permanently non-activating window can receive mouseup without mousedown after being hidden and reused.
+    // setFocusable only permits activation on a deliberate click; showInactive keeps notifications in the background.
+    win.setFocusable(allowed);
+}
+
 function setGhost(index: number) {
     if (index === ghostIndex) return;
     ghostIndex = index;
@@ -223,37 +278,92 @@ function dismissAll() {
     run("window.dismissAll?.()");
 }
 
-function registerShortcut(accelerator: string) {
-    if (shortcut === accelerator) return;
-    unregisterShortcut();
-    if (!accelerator) return;
+/** Unlocked cards are clickable and fully visible, whatever the game, ghost and typing states, and their timers wait */
+function setUnlocked(value: boolean) {
+    unlockedUntil = Date.now() + UNLOCK_IDLE;
+    if (value === unlocked) return;
+    unlocked = value;
+    run(`window.setUnlocked?.(${value})`);
+}
 
-    try {
-        if (globalShortcut.register(accelerator, dismissAll)) shortcut = accelerator;
-    } catch {
-        // Invalid accelerator: the setting is free text
+function toggleUnlocked() {
+    setUnlocked(!unlocked);
+    // Applied right away rather than on the next tick, which may be 150 ms away
+    if (tickTimer) {
+        clearTimeout(tickTimer);
+        tickTimer = null;
+        tick();
     }
 }
 
-function unregisterShortcut() {
-    if (!shortcut) return;
-    try {
-        globalShortcut.unregister(shortcut);
-    } catch { }
-    shortcut = null;
+function registerShortcuts(l: OverlayLayout) {
+    const key = l.shortcut + "\n" + l.unlockShortcut;
+    if (shortcutKey === key) return;
+    unregisterShortcuts();
+    shortcutKey = key;
+
+    const register = (accelerator: string, callback: () => void) => {
+        if (!accelerator || registered.includes(accelerator)) return;
+        try {
+            if (globalShortcut.register(accelerator, callback)) registered.push(accelerator);
+        } catch {
+            // Invalid accelerator: the setting is free text
+        }
+    };
+    register(l.shortcut, dismissAll);
+    register(l.unlockShortcut, toggleUnlocked);
+}
+
+function unregisterShortcuts() {
+    for (const accelerator of registered) {
+        try {
+            globalShortcut.unregister(accelerator);
+        } catch { }
+    }
+    registered = [];
+    shortcutKey = null;
+}
+
+/** On Windows, distinguish a foreground game from a background game, another app and the Start menu. */
+function inGame() {
+    if (!gamePids.size || (discordWin && !discordWin.isDestroyed() && discordWin.isFocused())) return false;
+    if (process.platform === "win32")
+        return !!foreground && Date.now() - foregroundAt < 1500 && gamePids.has(foreground.pid);
+    return true;
+}
+
+function onOtherDisplay() {
+    return gameDisplayId != null && placedDisplayId != null && placedDisplayId !== gameDisplayId;
+}
+
+/** In game, the cards let the mouse through until the unlock shortcut */
+function isLocked() {
+    return !!layout?.lockInGame && !unlocked && inGame() && !onOtherDisplay();
 }
 
 /** Which card box the cursor is over, in the coordinates the page reports them in */
 function hoveredBox(cursor: Electron.Point, bounds: Electron.Rectangle, margin = 0) {
-    // Card rects are in CSS pixels, the cursor in screen DIPs
-    const x = (cursor.x - bounds.x) / nativeZoom;
-    const y = (cursor.y - bounds.y) / nativeZoom;
+    if (bounds.width <= 0 || bounds.height <= 0) return -1;
+    // Match the viewport actually rendered on this monitor. The requested zoom alone is not a measurement:
+    // Chromium's effective viewport can differ after a monitor/DPI change or when setZoomFactor is unavailable.
+    const scaleX = pageViewport ? bounds.width / pageViewport.width : nativeZoom;
+    const scaleY = pageViewport ? bounds.height / pageViewport.height : nativeZoom;
+    const x = (cursor.x - bounds.x) / scaleX;
+    const y = (cursor.y - bounds.y) / scaleY;
     return cardRects.findIndex(([left, top, right, bottom]) =>
         x >= left - margin && x <= right + margin && y >= top - margin && y <= bottom + margin);
 }
 
 function updateHover(index: number, now: number) {
-    if (dragging) {
+    if (isLocked() || !layout?.clickable) {
+        pointerDown = dragging = false;
+        hoverSince = 0;
+        setGhost(-1);
+        setInteractive(false);
+        return;
+    }
+
+    if (dragging || pointerDown) {
         setGhost(-1);
         setInteractive(true);
         return;
@@ -266,7 +376,7 @@ function updateHover(index: number, now: number) {
         return;
     }
 
-    if (layout?.hover === "ghost") {
+    if (layout?.hover === "ghost" && !unlocked) {
         hoverSince ||= now;
         const rested = now - hoverSince >= GHOST_DWELL;
         setGhost(rested ? -1 : index);
@@ -278,13 +388,17 @@ function updateHover(index: number, now: number) {
 }
 
 /**
- * Input activity without a hook, from the system idle time (any keyboard or mouse input during the last second):
+ * In game, the cards stay faded whatever the input device: keyboard, mouse or controller. While they are locked,
+ * the cursor going past them is the game's camera, not the user heading for a card, so it does not bring them back.
+ *
+ * Elsewhere, input activity without a hook, from the system idle time (any keyboard or mouse input during the last second):
  * - "keyboard": only counts while the cursor stays still, so moving the mouse never fades anything;
- * - "any": counts any input, keys held in a game included, unless the cursor is close to a card.
+ * - "any": counts any input, keys held in a game and controller input (reported by the page) included,
+ *   unless the cursor is close to a card.
  * Only read every TYPING_CHECK ms, and never while the cursor is on (or, for "any", near) a card.
  */
 function updateTyping(cursor: Electron.Point, bounds: Electron.Rectangle, now: number) {
-    if (!layout || layout.typing === "off") {
+    if (!layout || layout.typing === "off" || unlocked || (inGame() && onOtherDisplay())) {
         setTyping(false);
         return;
     }
@@ -295,9 +409,27 @@ function updateTyping(cursor: Electron.Point, bounds: Electron.Rectangle, now: n
         lastMoveAt = now;
     }
 
-    // The cursor is on a card, or heading for one: the user wants to read it
-    if (interactive || ghostIndex >= 0 || (layout.typingTrigger === "any" && hoveredBox(cursor, bounds, NEAR_CARD) >= 0)) {
+    if (isLocked()) {
+        setTyping(true);
+        return;
+    }
+
+    const gaming = inGame();
+
+    // Alt+Tab/Start releases the in-game protection even if the game keeps running in the background.
+    if (gamePids.size && !gaming && process.platform === "win32") {
         setTyping(false);
+        return;
+    }
+
+    // The cursor is on a card, or heading for one: the user wants to read it
+    if (interactive || ghostIndex >= 0 || ((gaming || layout.typingTrigger === "any") && hoveredBox(cursor, bounds, NEAR_CARD) >= 0)) {
+        setTyping(false);
+        return;
+    }
+
+    if (gaming) {
+        setTyping(true);
         return;
     }
 
@@ -309,9 +441,21 @@ function updateTyping(cursor: Electron.Point, bounds: Electron.Rectangle, now: n
         if (now - lastMoveAt < TYPING_STILL) return;
     }
 
+    if (layout.typingTrigger === "any" && now - lastPadAt < PAD_ACTIVE) {
+        setTyping(true);
+        return;
+    }
+
     if (now - lastTypingCheck < TYPING_CHECK) return;
     lastTypingCheck = now;
     setTyping(powerMonitor.getSystemIdleTime() === 0);
+}
+
+/** Unlocked cards lock again once the cursor stayed away from them for UNLOCK_IDLE */
+function updateUnlocked(index: number, now: number) {
+    if (!unlocked) return;
+    if (index >= 0 || dragging) unlockedUntil = now + UNLOCK_IDLE;
+    else if (now >= unlockedUntil) setUnlocked(false);
 }
 
 /**
@@ -327,10 +471,14 @@ function tick() {
     const cursor = screen.getCursorScreenPoint();
     const bounds = win.getContentBounds();
 
-    updateHover(hoveredBox(cursor, bounds), now);
+    const index = hoveredBox(cursor, bounds);
+    updateUnlocked(index, now);
+    syncFocusable();
+    updateHover(index, now);
     updateTyping(cursor, bounds, now);
 
-    if (now - lastReassert >= REASSERT_INTERVAL) {
+    // Restacking a native window during a press can interrupt its pointer capture on Windows.
+    if (!pointerDown && !dragging && now - lastReassert >= REASSERT_INTERVAL) {
         lastReassert = now;
         bringToFront(win);
     }
@@ -358,16 +506,19 @@ function stopTicking() {
 function resetPageEffects() {
     ghostIndex = -1;
     typing = false;
-    run("window.setGhost?.(-1); window.setTyping?.(false)");
+    unlocked = false;
+    run("window.setGhost?.(-1); window.setTyping?.(false); window.setUnlocked?.(false)");
 }
 
 function hideOverlay() {
     stopTicking();
     resetPageEffects();
-    unregisterShortcut();
+    unregisterShortcuts();
     dragging = false;
+    pointerDown = false;
     setInteractive(false);
     cardRects = [];
+    pageViewport = null;
     if (win && !win.isDestroyed()) win.hide();
 
     if (idleTimer) clearTimeout(idleTimer);
@@ -378,15 +529,25 @@ function hideOverlay() {
 }
 
 function targetDisplay(l: OverlayLayout) {
+    if (gamePids.size && l.gameDisplay) {
+        const selected = screen.getAllDisplays().find(d => String(d.id) === l.gameDisplay);
+        if (selected) return selected;
+    }
     if (l.display === "primary") return screen.getPrimaryDisplay();
     if (l.display === "discord" && discordWin && !discordWin.isDestroyed()) return screen.getDisplayMatching(discordWin.getBounds());
-    // While gaming, the cursor sits on the game's monitor
+    // Keep the game's display stable while its cursor is released onto another monitor.
+    if (gamePids.size && gameDisplayId != null) {
+        const gaming = screen.getAllDisplays().find(d => d.id === gameDisplayId);
+        if (gaming) return gaming;
+    }
     return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
 }
 
 /** The window is a column in the chosen corner, as tall as allowed; cards stack inside it */
 function place(w: BrowserWindow, l: OverlayLayout) {
-    const { workArea } = targetDisplay(l);
+    const display = targetDisplay(l);
+    placedDisplayId = display.id;
+    const { workArea } = display;
     const offsetX = Math.max(0, Math.min(l.offsetX, workArea.width / 2));
     const offsetY = Math.max(0, Math.min(l.offsetY, workArea.height / 2));
     const width = Math.min(workArea.width - offsetX, Math.ceil((l.maxWidth + 2 * PAGE_MARGIN) * l.scale));
@@ -408,6 +569,94 @@ function place(w: BrowserWindow, l: OverlayLayout) {
     const y = vertical === "top" ? workArea.y + offsetY : workArea.y + workArea.height - height - offsetY;
 
     w.setBounds({ x: Math.round(x), y: Math.round(y), width, height });
+}
+
+function refreshPlacement() {
+    if (win && !win.isDestroyed() && win.isVisible() && layout) {
+        dragging = false;
+        pointerDown = false;
+        hoverSince = 0;
+        setGhost(-1);
+        setInteractive(false);
+        place(win, layout);
+        syncFocusable();
+    }
+}
+
+function receiveForeground(value: ForegroundWindow | null) {
+    const wasGaming = inGame();
+    foreground = value;
+    foregroundAt = Date.now();
+    if (value && gamePids.has(value.pid)) {
+        const bounds = screen.screenToDipRect(null, value.monitor);
+        const display = screen.getDisplayMatching(bounds);
+        if (gameDisplayId !== display.id) {
+            gameDisplayId = display.id;
+            refreshPlacement();
+        }
+    }
+    if (wasGaming !== inGame()) {
+        dragging = false;
+        pointerDown = false;
+        hoverSince = 0;
+        setGhost(-1);
+        setInteractive(false);
+    }
+    syncFocusable();
+}
+
+function stopObservingGames() {
+    stopForeground?.();
+    stopForeground = null;
+    foreground = null;
+    foregroundAt = 0;
+    app.removeListener("will-quit", stopObservingGames);
+}
+
+/** Plain serializable display data for the renderer's screen picker. */
+export function getDisplays(): OverlayMonitor[] {
+    const primary = screen.getPrimaryDisplay().id;
+    return screen.getAllDisplays().map(d => ({
+        id: String(d.id),
+        label: d.label,
+        primary: d.id === primary,
+        width: Math.round(d.size.width * d.scaleFactor),
+        height: Math.round(d.size.height * d.scaleFactor)
+    }));
+}
+
+/** Read-only troubleshooting data: window geometry and input state, without any notification/message content. */
+export function getDiagnostics() {
+    const visible = !!win && !win.isDestroyed() && win.isVisible();
+    const bounds = win && !win.isDestroyed() ? win.getContentBounds() : null;
+    const cursor = screen.getCursorScreenPoint();
+    return {
+        hitTest: "viewport-v1",
+        visible,
+        bounds,
+        cursor,
+        pageViewport,
+        nativeZoom,
+        cardRects,
+        hovered: visible && bounds ? hoveredBox(cursor, bounds) : -1,
+        interactive,
+        focusable,
+        pointerDown,
+        dragging,
+        clickable: layout?.clickable ?? false,
+        gameInForeground: inGame(),
+        locked: isLocked(),
+        placedDisplayId,
+        gameDisplayId,
+        displays: screen.getAllDisplays().map(d => ({ id: d.id, bounds: d.bounds, scaleFactor: d.scaleFactor }))
+    };
+}
+
+/** Moving the game-only display also moves cards that are already visible. */
+export function setGameDisplay(_: IpcMainInvokeEvent, displayId: string) {
+    if (!layout) return;
+    layout = { ...layout, gameDisplay: displayId };
+    refreshPlacement();
 }
 
 function sameLayout(a: OverlayLayout | null, b: OverlayLayout) {
@@ -437,8 +686,9 @@ export async function showNotification(event: IpcMainInvokeEvent, data: OverlayN
         place(w, data.layout);
     }
     layout = data.layout;
-    bringToFront(w);
-    registerShortcut(data.layout.shortcut);
+    syncFocusable();
+    if (!pointerDown && !dragging) bringToFront(w);
+    registerShortcuts(data.layout);
     startTicking();
 
     const cssZoom = nativeZoom === 1 ? data.layout.scale : 1;
@@ -449,6 +699,21 @@ export async function showNotification(event: IpcMainInvokeEvent, data: OverlayN
 export function isDiscordFocused(event: IpcMainInvokeEvent) {
     const w = BrowserWindow.fromWebContents(event.sender);
     return !!w && w.isVisible() && !w.isMinimized() && w.isFocused();
+}
+
+export function setRunningGames(event: IpcMainInvokeEvent, pids: number[]) {
+    discordWin = BrowserWindow.fromWebContents(event.sender) ?? discordWin;
+    gamePids = new Set(pids.filter(pid => Number.isInteger(pid) && pid > 0));
+    if (gamePids.size) {
+        if (process.platform === "win32" && !stopForeground) {
+            stopForeground = watchForeground(receiveForeground);
+            app.on("will-quit", stopObservingGames);
+        }
+    } else {
+        stopObservingGames();
+        gameDisplayId = null;
+    }
+    refreshPlacement();
 }
 
 /** Resolves with the next click on a card, or null when superseded (plugin restart, renderer reload) */
@@ -462,13 +727,24 @@ export function nextAction(): Promise<OverlayAction | null> {
 
 export function destroy() {
     stopTicking();
-    unregisterShortcut();
+    unregisterShortcuts();
+    stopObservingGames();
+    gamePids.clear();
+    gameDisplayId = null;
+    placedDisplayId = null;
+    pointerDown = dragging = false;
+    screen.removeListener("display-added", refreshPlacement);
+    screen.removeListener("display-removed", refreshPlacement);
+    screen.removeListener("display-metrics-changed", refreshPlacement);
+    unlocked = false;
+    lastPadAt = 0;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = null;
     actionWaiter?.(null);
     actionWaiter = null;
     pendingActions.length = 0;
     cardRects = [];
+    pageViewport = null;
     layout = null;
 
     if (win && !win.isDestroyed()) win.destroy();
