@@ -5,74 +5,42 @@
  */
 
 import * as DataStore from "@api/DataStore";
-import { isPluginEnabled, plugins } from "@api/PluginManager";
 import { migratePluginSettings } from "@api/Settings";
 import { Button } from "@components/Button";
 import ErrorBoundary from "@components/ErrorBoundary";
-import { Logger } from "@utils/Logger";
-import definePlugin, { PluginNative } from "@utils/types";
-import { findByProps } from "@webpack";
-import { ChannelStore, createRoot, Flux, FluxDispatcher, GuildChannelStore, RestAPI, RunningGameStore, UserStore } from "@webpack/common";
+import definePlugin from "@utils/types";
+import { createRoot, RestAPI, UserStore } from "@webpack/common";
 
-import {
-    boostEvidence, getQuestApplication, getQuestTask, HARDWARE_TASKS, isClaimable, normalizeQuest, primaryTask, QuestJob, questOrbs,
-    rewardSummary, waitFor
-} from "./catalog";
+import { getQuestTask, HARDWARE_TASKS, isClaimable, normalizeQuest, primaryTask, QuestJob, questOrbs, rewardSummary, waitFor } from "./catalog";
+import { cancelDialogs, confirmActivityRisk, suspendMenu } from "./dialogs";
+import { BOOST_KEY, checkOrbsNitro, fetchBalance, resetBalance, updateBoostEvidence } from "./orbs";
 import { claimWithDiscord, hasDiscordDialog } from "./rewards";
-import { bulkReason, discordBoostEligibility, getCatalog, hasNitro, isCompleted, orbBoost, unavailableReason } from "./selectors";
+import {
+    abortError, announce, cancelLater, CaptchaRequired, clearTimers, currentAccountId, isAbort, later, logger, nameOf, questsStore, toast
+} from "./runtime";
+import { bulkReason, getCatalog, isCompleted, orbBoost, unavailableReason } from "./selectors";
 import { PLUGIN_NAME, settings } from "./settings";
-import { actions, Dialog, emit, state, ToastType } from "./state";
+import { actions, emit, state } from "./state";
 import managedStyle from "./styles.css?managed";
+import {
+    AchievementCompletionError, completeActivityAchievement, EngineContext, enroll, restoreFakeGame, runDesktop, runSession, runVideo, setProgress
+} from "./tasks";
 import { Launcher } from "./ui/Launcher";
 import { QcRoot } from "./ui/Root";
 
 migratePluginSettings(PLUGIN_NAME, "Quest Auto Completer");
 
-const Native = VencordNative.pluginHelpers[PLUGIN_NAME] as PluginNative<typeof import("./native")>;
-const logger = new Logger(PLUGIN_NAME, "#C084FC");
-
 const ROOT_ID = "qc-root";
 const QUEUE_KEY = `${PLUGIN_NAME}-queue`;
 const STATS_KEY = `${PLUGIN_NAME}-stats`;
-/** What past claims taught about the Nitro multiplier, by account id */
-const BOOST_KEY = `${PLUGIN_NAME}-boost`;
-const BALANCE_TTL = 60_000;
-/** Discord EntitlementType: bought in the Shop with Orbs; PREMIUM_SUBSCRIPTION: a paid Nitro subscription */
-const ENTITLEMENT_VIRTUAL_CURRENCY = 12;
-const ENTITLEMENT_PREMIUM_SUBSCRIPTION = 2;
 /** Catalog fetches are reused for this long unless forced */
 const CATALOG_TTL = 60_000;
-/** Heartbeats without any confirmed progress before a quest is given up */
-const MAX_STAGNANT = 6;
-
-// Discord QuestContentType: "where the action was initiated" (analytics field
-// required on enroll/claim). 1 = QUEST_BAR, the bar shown above the quest list.
-const QUEST_LOCATION = 1;
-
-class CaptchaRequired extends Error {
-    constructor() {
-        super("Captcha requis");
-    }
-}
-
-class AchievementCompletionError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = "AchievementCompletionError";
-    }
-}
-
-const abortError = () => new DOMException("Arrêt demandé", "AbortError");
-const isAbort = (error: any) => error?.name === "AbortError";
-const currentAccountId = (): string | undefined => UserStore.getCurrentUser()?.id;
-const nameOf = (quest: any): string => quest?.config?.messages?.questName ?? quest?.config?.application?.name ?? "Quête";
 
 // ── Lifecycle state ──────────────────────────────────────────────────────────
 
 let lifecycle: AbortController | null = null;
 let accountGeneration = 0;
 let engineController: AbortController | null = null;
-let restoreGame: (() => void) | null = null;
 let fetchPending: Promise<void> | null = null;
 let rewardTail: Promise<unknown> = Promise.resolve();
 let rewardController = new AbortController();
@@ -81,52 +49,6 @@ let cleanup: (() => void) | null = null;
 const consented = new Set<string>();
 /** Quests automatic starts already tried this session, so a failing one is not retried forever */
 const autoTried = new Set<string>();
-const cancelDialogs = new Set<() => void>();
-const timers = new Set<ReturnType<typeof setTimeout>>();
-
-function later(action: () => void, delay: number) {
-    const timer = setTimeout(() => {
-        timers.delete(timer);
-        action();
-    }, delay);
-    timers.add(timer);
-    return timer;
-}
-
-function cancelLater(timer: ReturnType<typeof setTimeout> | null) {
-    if (timer == null) return;
-    clearTimeout(timer);
-    timers.delete(timer);
-}
-
-// ── Toasts and announcements ─────────────────────────────────────────────────
-
-let toastId = 0;
-
-function toast(text: string, type: ToastType = "info", ttl = 4500) {
-    const id = ++toastId;
-    state.toasts = [...state.toasts.slice(-3), { id, text, type }];
-    emit();
-    later(() => {
-        state.toasts = state.toasts.map(t => t.id === id ? { ...t, leaving: true } : t);
-        emit();
-        later(() => {
-            state.toasts = state.toasts.filter(t => t.id !== id);
-            emit();
-        }, 250);
-    }, ttl);
-}
-
-/** A card in BetterNotifications' overlay, visible over games; false when that plugin is not running */
-function announce(id: string, title: string, text: string) {
-    if (!settings.store.overlayNotify || !isPluginEnabled("BetterNotifications")) return false;
-    try {
-        return !!(plugins.BetterNotifications as any).showExternal?.({ id: `qc-${id}-${Date.now()}`, title, subtitle: "Quêtes", text });
-    } catch (e) {
-        logger.error("BetterNotifications announcement failed", e);
-        return false;
-    }
-}
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
@@ -142,11 +64,6 @@ function saveStats() {
 }
 
 // ── Catalog ──────────────────────────────────────────────────────────────────
-
-let questsStoreCache: any = null;
-function questsStore(): any {
-    return questsStoreCache ??= findByProps("getQuest");
-}
 
 function mergeStore() {
     for (const quest of questsStore()?.quests?.values?.() ?? []) {
@@ -210,92 +127,6 @@ async function fetchQuests(force = false): Promise<void> {
     return fetchPending;
 }
 
-// ── Orbs: Nitro multiplier and balance ──────────────────────────────────────
-
-/** Learns from what Discord really paid whether this account gets the Nitro multiplier, and remembers it per account */
-function updateBoostEvidence() {
-    const evidence = boostEvidence(state.catalog.values());
-    if (evidence === undefined || evidence === state.boost.claimed) return;
-    state.boost = { ...state.boost, claimed: evidence };
-    const accountId = currentAccountId();
-    if (accountId) DataStore.update<Record<string, boolean>>(BOOST_KEY, all => ({ ...all, [accountId]: evidence })).catch(() => { });
-    emit();
-}
-
-/**
- * Until a claim tells, the entitlements do: Nitro bought in the Shop with Orbs is an entitlement redeemed with virtual
- * currency, and does not get the multiplier although the account shows as Nitro.
- */
-async function checkOrbsNitro() {
-    const accountId = currentAccountId();
-    // Discord’s own eligibility check makes this guess unnecessary
-    if (!hasNitro() || state.boost.claimed != null || !accountId || discordBoostEligibility() !== undefined) return;
-    try {
-        const response = await RestAPI.get({ url: "/users/@me/entitlements", query: { with_sku: true, exclude_ended: true } });
-        const entitlements = response?.body ?? response;
-        if (!Array.isArray(entitlements) || currentAccountId() !== accountId) return;
-
-        const now = Date.now();
-        const active = (e: any) => !e?.deleted && (!e?.ends_at || Date.parse(e.ends_at) > now);
-        const premium = (e: any) => e?.subscription_plan != null || /nitro/i.test(e?.sku?.name ?? "");
-        const boughtWithOrbs = entitlements.some(e => active(e) && e.type === ENTITLEMENT_VIRTUAL_CURRENCY && premium(e));
-        const paid = entitlements.some(e => active(e) && e.type === ENTITLEMENT_PREMIUM_SUBSCRIPTION);
-        state.boost = { ...state.boost, orbsNitro: boughtWithOrbs && !paid };
-        emit();
-    } catch (error) {
-        logger.info("Entitlements unavailable, the Nitro multiplier will be confirmed by the next claim", error);
-    }
-}
-
-let balanceFetchedAt = 0;
-let balanceWarned = false;
-
-/** Discord keeps the balance shown in Quest Home and the Shop in a store; its name is not documented */
-function balanceFromStores(): number | undefined {
-    try {
-        for (const store of (Flux.Store as any).getAll?.() ?? []) {
-            if (!/virtualcurrency|orb/i.test(store?.getName?.() ?? "")) continue;
-            for (const key of ["getBalance", "getVirtualCurrencyBalance", "getOrbsBalance", "getOrbBalance"]) {
-                if (typeof store[key] !== "function") continue;
-                const value = store[key]();
-                const amount = Number(typeof value === "object" ? value?.balance ?? value?.amount : value);
-                if (value != null && Number.isFinite(amount)) return amount;
-            }
-            if (Number.isFinite(store.balance)) return store.balance;
-        }
-    } catch { }
-}
-
-async function fetchBalance(force = false) {
-    if (!force && Date.now() - balanceFetchedAt < BALANCE_TTL) return;
-    balanceFetchedAt = Date.now();
-    const accountId = currentAccountId();
-
-    let balance = balanceFromStores();
-    if (balance == null) {
-        try {
-            const response = await RestAPI.get({ url: "/users/@me/virtual-currency/balance" });
-            const body = response?.body ?? response;
-            const amount = Number(body?.balance ?? body?.amount);
-            if (Number.isFinite(amount)) balance = amount;
-        } catch { }
-    }
-
-    if (currentAccountId() !== accountId) return;
-    if (balance == null) {
-        if (!balanceWarned) {
-            balanceWarned = true;
-            const names = ((Flux.Store as any).getAll?.() ?? []).map((store: any) => store?.getName?.()).filter((name: string) => /currency|orb|wallet|balance/i.test(name ?? ""));
-            logger.info("Orb balance not found; stores that look related:", names);
-        }
-        return;
-    }
-    if (balance !== state.balance) {
-        state.balance = balance;
-        emit();
-    }
-}
-
 // ── Menu ─────────────────────────────────────────────────────────────────────
 
 function openMenu() {
@@ -307,68 +138,10 @@ function openMenu() {
     void fetchBalance();
 }
 
-/** Hides the menu until the returned function is called; overlapping reasons stack */
-function suspendMenu() {
-    state.suspended++;
-    emit();
-    let released = false;
-    return () => {
-        if (released) return;
-        released = true;
-        state.suspended = Math.max(0, state.suspended - 1);
-        emit();
-    };
-}
-
 function closeMenu() {
     if (!state.menuOpen) return;
     state.menuOpen = false;
     emit();
-}
-
-/** Shows a QC dialog; resolves false when dismissed, stopped or superseded by an account change */
-function askDialog(make: (resolve: (value: boolean) => void) => Dialog, signal: AbortSignal): Promise<boolean> {
-    return new Promise(resolve => {
-        if (signal.aborted || state.dialog) {
-            if (state.dialog) toast("Une confirmation est déjà ouverte.", "info");
-            resolve(false);
-            return;
-        }
-
-        let settled = false;
-        const finish = (value: boolean) => {
-            if (settled) return;
-            settled = true;
-            signal.removeEventListener("abort", abort);
-            cancelDialogs.delete(abort);
-            if (state.dialog === dialog) state.dialog = null;
-            emit();
-            resolve(value);
-        };
-        const abort = () => finish(false);
-        const dialog = make(finish);
-
-        signal.addEventListener("abort", abort, { once: true });
-        cancelDialogs.add(abort);
-        state.dialog = dialog;
-        emit();
-    });
-}
-
-function confirmActivityRisk(quest: any, signal: AbortSignal) {
-    return askDialog(resolve => ({ type: "risk", quest, resolve }), signal);
-}
-
-/** Human-in-the-loop captcha: QC never solves it, it waits for the user to solve Discord's own */
-async function promptHumanCaptcha(label: string, signal: AbortSignal) {
-    const release = suspendMenu();
-    try {
-        const solved = await askDialog(resolve => ({ type: "captcha", label, resolve }), signal);
-        if (signal.aborted) throw abortError();
-        if (!solved) throw new CaptchaRequired();
-    } finally {
-        release();
-    }
 }
 
 // ── Queue ────────────────────────────────────────────────────────────────────
@@ -441,7 +214,7 @@ async function resumeSavedQueue() {
 function stopEngine() {
     state.queue.cancel();
     engineController?.abort();
-    restoreGame?.();
+    restoreFakeGame();
     emit();
     saveQueue();
 }
@@ -551,330 +324,6 @@ function markClaimed(quest: any) {
 }
 
 // ── Engine ───────────────────────────────────────────────────────────────────
-
-interface EngineContext {
-    signal: AbortSignal;
-    check(): void;
-    sleep(ms: number): Promise<void>;
-}
-
-const isCaptchaBody = (body: any) => !!(body?.captcha_key || body?.captcha_sitekey || body?.captcha_service);
-
-/** Discord's own HTTP client: same headers and fingerprint as the real client */
-async function api(ctx: EngineContext, url: string, body: any) {
-    ctx.check();
-    try {
-        const response = await RestAPI.post({ url, body });
-        ctx.check();
-        return normalizeQuest(response?.body ?? response);
-    } catch (error: any) {
-        ctx.check();
-        const errorBody = error?.body ?? error?.response?.body;
-        if (isCaptchaBody(errorBody)) throw new CaptchaRequired();
-        throw new Error(errorBody?.message || error?.message || `La requête ${url} a échoué`);
-    }
-}
-
-/** On a captcha, lets the user solve Discord's real one, then retries once */
-async function withCaptcha<T>(ctx: EngineContext, label: string, action: () => Promise<T>): Promise<T> {
-    try {
-        return await action();
-    } catch (error) {
-        if (!(error instanceof CaptchaRequired)) throw error;
-        if (!settings.store.captchaVerification) {
-            toast(`Captcha demandé pour ${label} : active « Captcha » dans les réglages pour le résoudre.`, "warn", 6000);
-            throw error;
-        }
-        await promptHumanCaptcha(label, ctx.signal);
-        return await action();
-    }
-}
-
-function setProgress(job: QuestJob, detail: string, fraction: number | null) {
-    job.detail = detail;
-    if (fraction != null) job.progress = Math.max(0, Math.min(1, fraction));
-    emit();
-}
-
-/** Shared by every time task: send, report, give up after MAX_STAGNANT answers without progress, wait, repeat */
-async function heartbeatLoop(ctx: EngineContext, job: QuestJob, options: {
-    target: number;
-    done: number;
-    interval: number;
-    detail: string;
-    send(progress: number): Promise<number>;
-}) {
-    const { target, interval, detail, send } = options;
-    let progress = options.done;
-    let stagnant = 0;
-    setProgress(job, detail, progress / target);
-
-    while (progress < target) {
-        ctx.check();
-        const previous = progress;
-        progress = await send(progress);
-        setProgress(job, detail, progress / target);
-        if (progress >= target) break;
-
-        stagnant = progress > previous ? 0 : stagnant + 1;
-        if (stagnant >= MAX_STAGNANT) throw new Error("Aucune progression confirmée par Discord");
-        await ctx.sleep(interval);
-    }
-}
-
-/** Discord encodes the current user as the stream owner; guild channels use a different prefix from private calls */
-function activityStreamKey(): string | undefined {
-    const ownerId = currentAccountId();
-    if (!ownerId) return;
-
-    const privateChannelId = (ChannelStore as any).getSortedPrivateChannels?.()?.[0]?.id;
-    if (privateChannelId) return `call:${privateChannelId}:${ownerId}`;
-
-    const guilds: any[] = Object.values((GuildChannelStore as any).getAllGuilds?.() ?? {});
-    for (const guild of guilds) {
-        const voiceChannel = guild?.VOCAL?.[0]?.channel;
-        const guildId = voiceChannel?.guild_id ?? voiceChannel?.guildId ?? guild?.id;
-        if (guildId && voiceChannel?.id) return `guild:${guildId}:${voiceChannel.id}:${ownerId}`;
-    }
-}
-
-async function enroll(ctx: EngineContext, quest: any) {
-    if (quest.userStatus?.enrolledAt) return;
-    // A deliberate selection always enrolls, independently of autoAccept. Never report progress after a failed enrollment.
-    const status = await withCaptcha(ctx, `l’acceptation de ${nameOf(quest)}`, () => {
-        ctx.check();
-        const enrolled = normalizeQuest(questsStore()?.getQuest?.(quest.id)?.userStatus);
-        return enrolled?.enrolledAt ? Promise.resolve(enrolled) : api(ctx, `/quests/${quest.id}/enroll`, {
-            location: QUEST_LOCATION,
-            metadata_sealed: quest.metadataSealed ?? null,
-            traffic_metadata_sealed: quest.trafficMetadataSealed ?? null
-        });
-    });
-    quest.userStatus = { ...quest.userStatus, ...status, enrolledAt: status?.enrolledAt ?? new Date().toISOString() };
-}
-
-async function runVideo(ctx: EngineContext, job: QuestJob, quest: any, taskName: string, target: number, done: number) {
-    await heartbeatLoop(ctx, job, {
-        target, done, interval: 10_000, detail: "Vidéo en cours",
-        async send(progress) {
-            // Discord refuses timestamps ahead of the time elapsed since enrollment
-            const enrolled = Date.parse(quest.userStatus?.enrolledAt ?? "") || Date.now();
-            const ceiling = Math.floor((Date.now() - enrolled) / 1000) + 10;
-            const timestamp = Math.min(progress + 10, target, ceiling);
-            const response = await withCaptcha(ctx, nameOf(quest), () => api(ctx, `/quests/${quest.id}/video-progress`, { timestamp }));
-            const reported = response?.progress?.[taskName]?.value;
-            if (response?.completedAt || reported >= target) return target;
-            if (timestamp >= target) throw new Error("Discord n’a pas confirmé la fin de la vidéo");
-            return typeof reported === "number" ? reported : timestamp;
-        }
-    });
-}
-
-async function runDesktop(ctx: EngineContext, job: QuestJob, quest: any, taskName: string, taskConfig: any, target: number, done: number) {
-    const store = RunningGameStore as any;
-    const { id: applicationId, name: applicationName } = getQuestApplication(quest, taskConfig);
-    if (!store?.getRunningGames || !FluxDispatcher) throw new Error("Module de détection des jeux de Discord indisponible");
-    if (!applicationId || !applicationName) throw new Error("Discord n’a pas fourni les informations du jeu");
-
-    // Objectives inside the game are validated by its own servers: only the playtime can be completed here
-    if (taskConfig?.objectives?.length > 0)
-        toast(`${nameOf(quest)} a aussi des objectifs en jeu : le temps de jeu sera validé, lance le jeu pour les objectifs.`, "warn", 7000);
-
-    const exeName = applicationName.replace(/[/\\:*?"<>|]/g, "").replace(/\s/g, "") + ".exe";
-    const pid = Math.floor(Math.random() * 30000) + 1000;
-    const fakeGame = {
-        cmdLine: `C:\\Program Files\\${applicationName}\\${exeName}`,
-        exeName,
-        exePath: `c:/program files/${applicationName.toLowerCase()}/${exeName}`,
-        hidden: false,
-        isLauncher: false,
-        id: applicationId,
-        name: applicationName,
-        pid,
-        pidPath: [pid],
-        processName: applicationName,
-        start: Date.now(),
-        // BetterNotifications must not take it for a game being played
-        vcQuestFake: true
-    };
-
-    // Games Discord is already tracking, including those started during the quest, stay visible
-    const realGetRunningGames = store.getRunningGames;
-    const realGetGameForPID = store.getGameForPID;
-    const fakeGetRunningGames = () => [...realGetRunningGames.call(store).filter((game: any) => game.pid !== pid), fakeGame];
-    const fakeGetGameForPID = (p: any) => p === pid ? fakeGame : realGetGameForPID?.call(store, p);
-    store.getRunningGames = fakeGetRunningGames;
-    store.getGameForPID = fakeGetGameForPID;
-
-    let restored = false;
-    const restore = () => {
-        if (restored) return;
-        restored = true;
-        if (store.getRunningGames === fakeGetRunningGames) store.getRunningGames = realGetRunningGames;
-        if (store.getGameForPID === fakeGetGameForPID) store.getGameForPID = realGetGameForPID;
-        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: store.getRunningGames() } as any);
-        if (restoreGame === restore) restoreGame = null;
-    };
-    restoreGame = restore;
-
-    try {
-        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: [fakeGame], games: fakeGetRunningGames() } as any);
-        await heartbeatLoop(ctx, job, {
-            target, done, interval: 30_000, detail: `Jeu : ${applicationName}`,
-            async send() {
-                const response = await withCaptcha(ctx, nameOf(quest), () => api(ctx, `/quests/${quest.id}/heartbeat`, { application_id: applicationId, terminal: false }));
-                const reported = response?.progress?.[taskName]?.value;
-                if (typeof reported === "number") return reported;
-                if (response?.completedAt) return target;
-                throw new Error("Discord n’a renvoyé aucune progression de jeu");
-            }
-        });
-        await api(ctx, `/quests/${quest.id}/heartbeat`, { application_id: applicationId, terminal: true });
-    } finally {
-        restore();
-    }
-}
-
-async function runSession(ctx: EngineContext, job: QuestJob, quest: any, taskName: string, taskConfig: any, target: number, done: number) {
-    const applicationId = getQuestApplication(quest, taskConfig).id;
-    if (!applicationId) throw new Error("Discord n’a pas fourni les informations de l’activité");
-    const streamKey = activityStreamKey();
-    if (!streamKey) throw new Error("Impossible de créer une session d’activité (aucun MP ni salon vocal)");
-
-    const activity = taskName === "PLAY_ACTIVITY";
-    await heartbeatLoop(ctx, job, {
-        target, done, interval: activity ? 20_000 : 30_000, detail: activity ? "Activité en cours" : "Streaming en cours",
-        async send() {
-            const response = await withCaptcha(ctx, nameOf(quest), () => api(ctx, `/quests/${quest.id}/heartbeat`, { stream_key: streamKey, application_id: applicationId, terminal: false }));
-            const reported = response?.progress?.[taskName]?.value;
-            if (typeof reported === "number") return reported;
-            if (response?.completedAt != null) return target;
-            throw new Error("Discord n’a renvoyé aucune progression d’activité");
-        }
-    });
-    await api(ctx, `/quests/${quest.id}/heartbeat`, { stream_key: streamKey, application_id: applicationId, terminal: true });
-}
-
-async function listOAuthGrants(): Promise<any[]> {
-    const response = await RestAPI.get({ url: "/oauth2/tokens" });
-    const grants = response?.body ?? response;
-    if (!Array.isArray(grants)) throw new AchievementCompletionError("Discord a renvoyé une liste d’applications autorisées invalide");
-    return grants;
-}
-
-/** Revokes the authorizations this quest created, only on the account they were created on */
-async function cleanupAchievementGrants(accountId: string, applicationId: string, previousGrantIds: Set<string>) {
-    const sameAccount = () => currentAccountId() === accountId;
-    if (!sameAccount()) return "account-changed";
-
-    const grants = await listOAuthGrants();
-    if (!sameAccount()) return "account-changed";
-
-    const created = grants.filter(grant => grant?.application?.id === applicationId
-        && typeof grant?.id === "string" && /^\d+$/.test(grant.id) && !previousGrantIds.has(grant.id));
-    for (const grant of created) {
-        if (!sameAccount()) return "account-changed";
-        await RestAPI.del({ url: `/oauth2/tokens/${grant.id}` });
-    }
-    return "cleaned";
-}
-
-async function completeActivityAchievement(ctx: EngineContext, quest: any, taskName: string, taskConfig: any, target: number) {
-    const applicationId = String(getQuestApplication(quest, taskConfig).id ?? "");
-    const questId = String(quest?.id ?? "");
-    if (!/^\d+$/.test(applicationId) || !/^\d+$/.test(questId))
-        throw new AchievementCompletionError("Discord n’a pas fourni d’informations valides sur l’activité");
-
-    const accountId = currentAccountId();
-    if (!accountId) throw new AchievementCompletionError("compte Discord introuvable");
-    const ensureSameAccount = () => {
-        ctx.check();
-        if (currentAccountId() !== accountId) throw new AchievementCompletionError("le compte Discord a changé pendant la quête");
-    };
-
-    // Some activity achievements accept an ordinary quest heartbeat: try that harmless path first
-    const streamKey = activityStreamKey();
-    if (streamKey) {
-        try {
-            const response = await api(ctx, `/quests/${questId}/heartbeat`, { stream_key: streamKey, application_id: applicationId, terminal: false });
-            ensureSameAccount();
-            const progress = response?.progress?.[taskName]?.value;
-            if ((typeof progress === "number" && progress >= target) || response?.completedAt != null) {
-                await api(ctx, `/quests/${questId}/heartbeat`, { stream_key: streamKey, application_id: applicationId, terminal: true }).catch(() => { });
-                ensureSameAccount();
-                return;
-            }
-        } catch (error) {
-            if (error instanceof AchievementCompletionError || isAbort(error)) throw error;
-            // A rejected heartbeat is expected for app-tracked achievements: continue with the activity flow
-        }
-    }
-
-    let previousGrantIds: Set<string> | undefined;
-    try {
-        ensureSameAccount();
-        const grants = await listOAuthGrants();
-        ensureSameAccount();
-        previousGrantIds = new Set(grants.filter(grant => grant?.application?.id === applicationId && typeof grant?.id === "string").map(grant => grant.id));
-
-        const authorizeResponse = await RestAPI.post({
-            url: "/oauth2/authorize",
-            query: { response_type: "code", client_id: applicationId, scope: "identify applications.commands applications.entitlements" },
-            body: {
-                permissions: "0",
-                authorize: true,
-                integration_type: 1,
-                location_context: { guild_id: "10000", channel_id: "10000", channel_type: 10000 }
-            }
-        });
-        ensureSameAccount();
-
-        const location = authorizeResponse?.body?.location;
-        const authCode = typeof location === "string" ? new URL(location, "https://discord.com").searchParams.get("code") : null;
-        if (!authCode) throw new AchievementCompletionError("Discord n’a pas renvoyé de code d’autorisation");
-
-        const ticketResponse = await RestAPI.post({ url: `/applications/${applicationId}/proxy-tickets`, body: {} });
-        ensureSameAccount();
-        const proxyTicket = ticketResponse?.body?.ticket;
-        if (typeof proxyTicket !== "string" || !proxyTicket) throw new AchievementCompletionError("Discord n’a pas renvoyé de ticket d’activité");
-
-        if (typeof Native?.authorizeActivityAchievement !== "function" || typeof Native?.reportActivityAchievement !== "function")
-            throw new AchievementCompletionError("le module natif d’activité est indisponible");
-
-        const referrer = `https://${applicationId}.discordsays.com/?instance_id=quest-completer&platform=desktop&discord_proxy_ticket=${encodeURIComponent(proxyTicket)}`;
-        const authorization = await Native.authorizeActivityAchievement({ appId: applicationId, questId, authCode, referrer });
-        ensureSameAccount();
-        if (!authorization.ok) throw new AchievementCompletionError(`l’autorisation de l’activité a échoué (${authorization.status || "erreur réseau"})`);
-
-        let token: string | undefined;
-        try {
-            const parsed = JSON.parse(authorization.body);
-            if (typeof parsed?.token === "string" && parsed.token) token = parsed.token;
-        } catch {
-            throw new AchievementCompletionError("l’activité a renvoyé une réponse d’autorisation invalide");
-        }
-        if (!token) throw new AchievementCompletionError("l’activité n’a pas renvoyé de jeton");
-
-        const progressResponse = await Native.reportActivityAchievement({ appId: applicationId, questId, token, target, referrer });
-        ensureSameAccount();
-        if (!progressResponse.ok) throw new AchievementCompletionError(`l’activité a refusé l’objectif (${progressResponse.status || "erreur réseau"})`);
-    } catch (error: any) {
-        if (error instanceof AchievementCompletionError || isAbort(error)) throw error;
-        const code = error?.body?.code ?? error?.response?.body?.code;
-        if (code === 50165) throw new AchievementCompletionError("l’activité est soumise à une limite d’âge ou indisponible pour ce compte");
-        throw new AchievementCompletionError("Discord a refusé la demande d’objectif d’activité");
-    } finally {
-        if (previousGrantIds) {
-            try {
-                if (await cleanupAchievementGrants(accountId, applicationId, previousGrantIds) === "account-changed")
-                    toast("Le compte a changé avant la vérification de l’autorisation temporaire. Vérifie Paramètres → Applications autorisées.", "warn", 10_000);
-            } catch (error: any) {
-                logger.error("Temporary activity authorization cleanup failed", error?.message ?? error);
-                toast("Impossible de vérifier la révocation de l’autorisation temporaire. Vérifie Paramètres → Applications autorisées.", "warn", 10_000);
-            }
-        }
-    }
-}
 
 async function runAchievement(ctx: EngineContext, job: QuestJob, quest: any, taskName: string, taskConfig: any, target: number, done: number) {
     setProgress(job, "Objectif d’activité en cours", done / target);
@@ -1005,7 +454,7 @@ async function runEngine() {
             state.queue.cancel();
         }
     } finally {
-        restoreGame?.();
+        restoreFakeGame();
         if (engineController === controller) {
             engineController = null;
             state.running = false;
@@ -1017,6 +466,28 @@ async function runEngine() {
 }
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
+
+/** Stops what is in flight and forgets everything tied to the account: on an account switch, and when the plugin stops */
+function resetSession() {
+    stopEngine();
+    cancelDialogs();
+    rewardController.abort();
+    rewardController = new AbortController();
+    state.claiming.clear();
+    state.catalog.clear();
+    state.queue.clear();
+    state.catalogUpdated = 0;
+    state.catalogError = "";
+    state.menuOpen = false;
+    state.suspended = 0;
+    state.loading = false;
+    fetchPending = null;
+    consented.clear();
+    autoTried.clear();
+    state.balance = null;
+    state.boost = {};
+    resetBalance();
+}
 
 function onKeydown(event: KeyboardEvent) {
     if (event.key !== "Escape" || hasDiscordDialog()) return;
@@ -1125,24 +596,7 @@ export default definePlugin({
             if (next === currentAccount) return;
             currentAccount = next;
             accountGeneration++;
-            stopEngine();
-            for (const cancel of cancelDialogs) cancel();
-            rewardController.abort();
-            rewardController = new AbortController();
-            state.claiming.clear();
-            state.catalog.clear();
-            state.queue.clear();
-            state.catalogUpdated = 0;
-            state.catalogError = "";
-            state.menuOpen = false;
-            state.suspended = 0;
-            state.loading = false;
-            fetchPending = null;
-            consented.clear();
-            autoTried.clear();
-            state.balance = null;
-            state.boost = {};
-            balanceFetchedAt = 0;
+            resetSession();
             emit();
             if (next) {
                 void fetchQuests(true);
@@ -1180,37 +634,18 @@ export default definePlugin({
 
         cleanup = () => {
             session.abort();
-            rewardController.abort();
-            rewardController = new AbortController();
-            stopEngine();
-            restoreGame?.();
-            for (const cancel of cancelDialogs) cancel();
+            resetSession();
             store?.removeChangeListener?.(onQuestsChange);
             UserStore.removeChangeListener(onAccountChange);
             document.removeEventListener("keydown", onKeydown, true);
-            for (const timer of timers) clearTimeout(timer);
-            timers.clear();
+            clearTimers();
             autoTimer = null;
             root.unmount();
             host.remove();
-            state.catalog.clear();
-            state.queue.clear();
-            state.claiming.clear();
             state.toasts = [];
             state.dialog = null;
-            state.balance = null;
-            state.boost = {};
-            balanceFetchedAt = 0;
-            state.catalogUpdated = 0;
-            state.catalogError = "";
-            state.loading = false;
             state.running = false;
-            state.menuOpen = false;
-            state.suspended = 0;
-            fetchPending = null;
             lifecycle = null;
-            consented.clear();
-            autoTried.clear();
             emit();
         };
     },

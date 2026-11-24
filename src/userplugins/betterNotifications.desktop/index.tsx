@@ -8,32 +8,28 @@ import { SettingsStore } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin, { PluginNative, ReporterTestable } from "@utils/types";
 import type { Channel } from "@vencord/discord-types";
-import { findByCodeLazy, waitFor } from "@webpack";
+import { waitFor } from "@webpack";
 import {
-    ApplicationStreamingStore, AuthenticationStore, ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, NavigationRouter,
-    NotificationSettingsStore, PresenceStore, ReadStateStore, RelationshipStore, RestAPI, RunningGameStore, SelectedChannelStore, showToast, SnowflakeUtils,
-    StreamerModeStore, UserGuildSettingsStore, UserStore, WindowStore
+    AuthenticationStore, ChannelStore, FluxDispatcher, NavigationRouter, NotificationSettingsStore, ReadStateStore, RestAPI, RunningGameStore,
+    SelectedChannelStore, showToast, SnowflakeUtils, WindowStore
 } from "@webpack/common";
 
-import { collectButtons, convertButton, convertEmbed, FormatOptions, imageAttachments, plainText, RawAuthor, RawComponent, RawMessage, toRich } from "./format";
+import { authorName, buildNotification, NotificationContent, whereLabel } from "./card";
+import { decide, Decision } from "./decision";
+import { findMonitor, saveMonitor } from "./displays";
+import { collectButtons, RawComponent, RawMessage } from "./format";
 import { detectedGames } from "./games";
 import { contextMenus } from "./menus";
-import { Level, matchesKeyword, MentionKind, migrateRules, pruneExpired, resolve, Rule, RuleKind, scopeChain, SoundLevel, sourceOf, withRule } from "./rules";
-import { settings, sourceDefaults } from "./settings";
+import { Level, migrateRules, pruneExpired, Rule, RuleKind, SoundLevel, withRule } from "./rules";
+import { settings } from "./settings";
 import managedStyle from "./styles.css?managed";
-import type { HoverBehavior, OverlayAction, OverlayDisplay, OverlayLayout, OverlayMenuItem, OverlayNotification, OverlayPosition, TypingBehavior, TypingTrigger } from "./types";
+import type { HoverBehavior, OverlayAction, OverlayDisplay, OverlayLayout, OverlayNotification, OverlayPosition, TypingBehavior, TypingTrigger } from "./types";
 import { bridge } from "./ui/bridge";
 import { openSettings } from "./ui/SettingsModal";
 
 const Native = VencordNative.pluginHelpers.BetterNotifications as PluginNative<typeof import("./native")>;
 const logger = new Logger("BetterNotifications");
 
-// Discord's own "should this message notify" check (mutes, notification settings, Do Not Disturb...)
-// (message, channelId, includeSelectedChannel = true, ignoreStatus = false)
-const discordShouldNotify = findByCodeLazy(".SUPPRESS_NOTIFICATIONS))return!1");
-
-/** Message flag set by @silent */
-const SUPPRESS_NOTIFICATIONS = 1 << 12;
 const INTERACTION_TYPE_COMPONENT = 3;
 const COMPONENT_BUTTON = 2;
 /** Messages kept around to resolve clicks, follow edits and match Discord's notifications */
@@ -44,16 +40,6 @@ const RAW_MESSAGE_WAIT = 250;
 const SOUND_WAIT = 300;
 const DEFAULT_SOUND = "message1";
 const SNOOZE = 60 * 60_000;
-
-interface Decision {
-    show: boolean;
-    sound: boolean;
-    priority: boolean;
-    /** Discord would have notified on its own */
-    discordWould: boolean;
-    /** Discord's own desktop notification must be skipped */
-    suppressNative: boolean;
-}
 
 interface Tracked {
     message: RawMessage;
@@ -79,7 +65,6 @@ const displayed = new Set<string>();
 const channelCards = new Map<string, { id: string; count: number; }>();
 
 let running = false;
-let warnedShouldNotify = false;
 
 function remember<T>(map: Map<string, T>, id: string, value: T) {
     map.delete(id);
@@ -113,102 +98,6 @@ function layout(): OverlayLayout {
     };
 }
 
-function avatarUrl(author: RawAuthor) {
-    if (author.avatar)
-        return `https://cdn.discordapp.com/avatars/${author.id}/${author.avatar}.png?size=64`;
-    return `https://cdn.discordapp.com/embed/avatars/${Number((BigInt(author.id) >> 22n) % 6n)}.png`;
-}
-
-/**
- * The name Discord shows: server nickname, then the nickname you gave a friend, then the display name.
- * The payload alone is not enough: depending on the path, its author lacks global_name and only the username was left.
- */
-function authorName(message: RawMessage, channel?: Channel) {
-    const { id } = message.author;
-    const guildId = channel?.guild_id ?? message.guild_id;
-    return message.member?.nick
-        || (guildId ? GuildMemberStore.getNick(guildId, id) : null)
-        || RelationshipStore.getNickname(id)
-        || (UserStore.getUser(id) as any)?.globalName
-        || message.author.global_name
-        || message.author.username;
-}
-
-function subtitleFor(channel: Channel) {
-    if (channel.isDM()) return "Message privé";
-    if (channel.isGroupDM()) return channel.name || "Groupe privé";
-    const guild = GuildStore.getGuild(channel.guild_id);
-    return guild ? `${guild.name} · #${channel.name}` : `#${channel.name}`;
-}
-
-// ── Decision ───────────────────────────────────────────────────────────────────
-
-function mentionMatches(message: RawMessage, channel: Channel, kinds: MentionKind[]) {
-    const me = UserStore.getCurrentUser()?.id;
-    // In a one-to-one conversation, every message is addressed to you
-    if (kinds.includes("me") && (channel.isDM() || message.mentions?.some(u => u.id === me))) return true;
-    if (kinds.includes("everyone") && message.mention_everyone) return true;
-    if (kinds.includes("keywords") && matchesKeyword(message.content, settings.store.keywords)) return true;
-    if (!kinds.includes("roles") || !channel.guild_id || !message.mention_roles?.length) return false;
-
-    const roles = GuildMemberStore.getMember(channel.guild_id, me)?.roles ?? [];
-    return message.mention_roles.some(r => roles.includes(r));
-}
-
-/** Discord's own verdict, with a simple mute check if its function cannot be found any more. ignoreStatus: as if not in Do Not Disturb */
-function discordWouldNotify(message: RawMessage, channel: Channel, ignoreStatus = false) {
-    try {
-        return !!discordShouldNotify(message, message.channel_id, true, ignoreStatus);
-    } catch (e) {
-        if (!warnedShouldNotify) {
-            warnedShouldNotify = true;
-            logger.error("Discord's notification check is unavailable, falling back to mutes only", e);
-        }
-        if (!ignoreStatus && PresenceStore.getStatus(UserStore.getCurrentUser()?.id) === "dnd") return false;
-        if (!channel.guild_id) return true;
-        return mentionMatches(message, channel, ["me", "roles", "everyone"])
-            || (!UserGuildSettingsStore.isMuted(channel.guild_id) && !UserGuildSettingsStore.isChannelMuted(channel.guild_id, channel.id));
-    }
-}
-
-/** null: not a message to notify at all (own message, blocked user, @silent) */
-function decide(message: RawMessage, channel: Channel): Decision | null {
-    const me = UserStore.getCurrentUser()?.id;
-    if (!me || message.author.id === me) return null;
-    if (RelationshipStore.isBlockedOrIgnored?.(message.author.id) ?? RelationshipStore.isBlocked(message.author.id)) return null;
-    if ((message.flags ?? 0) & SUPPRESS_NOTIFICATIONS) return null;
-
-    const rule = resolve(settings.store.rules, scopeChain(message.author.id, channel), sourceDefaults(sourceOf(channel)));
-    const discordWould = discordWouldNotify(message, channel);
-    // What Discord would notify outside Do Not Disturb, which priority rules go through
-    const discordAllows = rule.priority && !discordWould ? discordWouldNotify(message, channel, true) : discordWould;
-    // Priority rules also go through Do Not Disturb
-    const quiet = !rule.priority && PresenceStore.getStatus(me) === "dnd";
-
-    // Keywords count as mentions, which Discord would have notified even in a muted channel
-    const keyword = () => rule.mentions.includes("keywords") && matchesKeyword(message.content, settings.store.keywords);
-    const passes = (level: Level) => {
-        if (quiet) return false;
-        switch (level) {
-            case "all": return true;
-            case "discord": return discordAllows || keyword();
-            case "friends": return discordAllows && RelationshipStore.isFriend(message.author.id);
-            case "mentions": return mentionMatches(message, channel, rule.mentions);
-            default: return false;
-        }
-    };
-
-    const show = passes(rule.notify);
-    return {
-        show,
-        sound: passes(rule.sound),
-        priority: rule.priority,
-        discordWould,
-        // Whatever the overlay does not show, Discord must not show either
-        suppressNative: settings.store.hideNativeNotifications || !show
-    };
-}
-
 /**
  * Our own decision about the timing, independent of Discord's desktop notifications: Discord skips them when its in-game
  * overlay handles the message, when desktop notifications are set to "never", or when it wrongly believes it is focused.
@@ -226,81 +115,7 @@ async function focusState(channel: Channel) {
     };
 }
 
-// ── Building the card ──────────────────────────────────────────────────────────
-
-/** Only private conversations are masked: server messages, mentions included, stay readable */
-function privacyActive(channel: Channel) {
-    if (!channel.isDM() && !channel.isGroupDM()) return false;
-
-    switch (settings.store.privacy) {
-        case "always": return true;
-        case "streamer": return !!StreamerModeStore.enabled;
-        case "streaming": return !!StreamerModeStore.enabled || !!ApplicationStreamingStore.getCurrentUserActiveStream?.();
-        default: return false;
-    }
-}
-
-function menuFor(message: RawMessage, channel: Channel): OverlayMenuItem[] {
-    const where = channel.isDM() ? "cette conversation" : channel.isGroupDM() ? "ce groupe" : `#${channel.name}`;
-    const items: OverlayMenuItem[] = [
-        { key: "read", label: "Marquer comme lu" },
-        { key: "snooze-channel", label: `Silence 1 h pour ${where}` }
-    ];
-
-    if (channel.guild_id) {
-        items.push({ key: "mentions-guild", label: "Mentions seulement pour ce serveur" });
-        items.push({ key: "sound-guild", label: "Couper le son de ce serveur" });
-    } else items.push({ key: "sound-channel", label: `Couper le son de ${where}` });
-
-    if (!channel.isDM()) items.push({ key: "vip", label: `Toujours notifier ${authorName(message, channel)}` });
-
-    items.push({ key: "hide-channel", label: `Ne plus notifier ${where}`, danger: true });
-    if (channel.guild_id) items.push({ key: "hide-guild", label: "Ne plus notifier ce serveur", danger: true });
-    items.push({ key: "settings", label: "Réglages de BetterNotifications…" });
-    return items;
-}
-
-type NotificationContent = Omit<OverlayNotification, "duration" | "layout">;
-
-function buildNotification(message: RawMessage, channel: Channel, buttons: RawComponent[], count: number): NotificationContent {
-    const subtitle = subtitleFor(channel) + (count > 1 ? ` · ${count} messages` : "");
-    const base = { id: message.id, menu: menuFor(message, channel) };
-
-    const name = authorName(message, channel);
-
-    if (privacyActive(channel)) {
-        const text = "🔒 Contenu masqué";
-        return settings.store.privacyHideAuthor
-            ? { ...base, title: "Nouveau message privé", subtitle: count > 1 ? `${count} messages` : undefined, preview: text, content: [text] }
-            : { ...base, title: name, subtitle, icon: avatarUrl(message.author), preview: text, content: [text] };
-    }
-
-    const opts: FormatOptions = {
-        channelId: channel.id,
-        guildId: channel.guild_id ?? undefined,
-        gifs: settings.store.showGifs,
-        images: settings.store.showImages
-    };
-
-    const card = {
-        ...base,
-        title: name,
-        subtitle,
-        icon: avatarUrl(message.author),
-        preview: plainText(message),
-        buttons: settings.store.showButtons ? buttons.map(b => convertButton(b, opts)) : undefined
-    };
-
-    if (!settings.store.fullEmbeds)
-        return { ...card, content: [plainText(message)] };
-
-    return {
-        ...card,
-        content: toRich(message.content, opts),
-        embeds: message.embeds.map(e => convertEmbed(e, opts)),
-        images: imageAttachments(message, opts)
-    };
-}
+// ── Showing the card ───────────────────────────────────────────────────────────
 
 function show(data: NotificationContent & Partial<Pick<OverlayNotification, "update" | "replaces" | "priority">>) {
     Native.showNotification({ ...data, layout: layout(), duration: settings.store.duration * 1000 })
@@ -507,7 +322,7 @@ function handleMenu(entry: Tracked, key: string) {
     const { message } = entry;
     const channel = ChannelStore.getChannel(message.channel_id);
     if (!channel) return;
-    const where = channel.isDM() ? "cette conversation" : channel.isGroupDM() ? "ce groupe" : `#${channel.name}`;
+    const where = whereLabel(channel);
 
     switch (key) {
         case "read":
@@ -615,6 +430,22 @@ function syncGame() {
 
 function syncGameDisplay() {
     Native.setGameDisplay(settings.store.gameDisplay).catch(e => logger.error("Failed to change the game display", e));
+}
+
+/**
+ * Older versions saved the bare Electron display id, which stops matching when Windows restarts:
+ * save the monitor itself while that id is still valid.
+ */
+async function migrateGameDisplay() {
+    const saved = settings.store.gameDisplay;
+    if (!saved || saved.startsWith("{")) return;
+
+    try {
+        const monitor = findMonitor(saved, await Native.getDisplays());
+        if (monitor && settings.store.gameDisplay === saved) settings.store.gameDisplay = saveMonitor(monitor);
+    } catch (e) {
+        logger.error("Failed to migrate the game display", e);
+    }
 }
 
 // ── Settings migration ─────────────────────────────────────────────────────────
@@ -744,6 +575,7 @@ export default definePlugin({
         RunningGameStore.addChangeListener(syncGame);
         SettingsStore.addChangeListener("plugins.BetterNotifications.gameDisplay", syncGameDisplay);
         syncGame();
+        migrateGameDisplay();
     },
 
     stop() {

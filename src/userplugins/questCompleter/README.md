@@ -24,7 +24,10 @@ Un ajout manuel demande une confirmation **valable pour cette quête seulement**
 - `catalog.ts` : fonctions pures (normalisation, tâches, récompenses et Orbs, visuels, file). Testées par `catalog.test.ts`.
 - `selectors.ts` : vues calculées partagées (catalogue affiché, compteurs, Nitro, durée de la file).
 - `state.ts` : état partagé entre le moteur et l'interface, avec un rendu regroupé par micro-tâche.
-- `index.tsx` : moteur (une boucle de heartbeat commune à toutes les tâches), patches des boutons, cycle de vie.
+- `index.tsx` : catalogue, file, récompenses, patches des boutons, cycle de vie.
+- `tasks.ts` : exécution de chaque type de tâche (une boucle de heartbeat commune à toutes).
+- `orbs.ts` : multiplicateur Nitro et solde d'Orbs. `dialogs.ts` : confirmations et mise en retrait du menu.
+- `runtime.ts` : petits outils communs (toasts, minuteries, journal, store des quêtes), sans dépendance vers les modules ci-dessus.
 - `ui/` : interface React (bouton, menu, cartes, réglages, dialogues, toasts). `rewards.tsx` : récupération native. `native.ts` : requêtes vers l'activité.
 
 ## Ressources

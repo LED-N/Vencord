@@ -15,8 +15,13 @@ import { runInNewContext } from "node:vm";
 import ts from "typescript";
 
 const require = createRequire(import.meta.url);
-const source = readFileSync(new URL("../native.ts", import.meta.url), "utf8");
-const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+const compile = file => ts.transpileModule(readFileSync(new URL(file, import.meta.url), "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
+}).outputText;
+const compiled = compile("../native.ts");
+const displaysModule = {};
+runInNewContext(compile("../displays.ts"), { exports: displaysModule });
+const { findMonitor, saveMonitor } = displaysModule;
 
 const baseLayout = {
     position: "bottom-right", display: "cursor", gameDisplay: "", offsetX: 0, offsetY: 0,
@@ -95,6 +100,7 @@ function harness(overrides = {}, environment = {}) {
             unregister: key => shortcuts.delete(key)
         } },
         "file://overlay.html": { default: "" },
+        "./displays": displaysModule,
         "./windowsForeground": { watchForeground: callback => {
             foregroundCallback = callback;
             return () => stopCount++;
@@ -135,7 +141,12 @@ function harness(overrides = {}, environment = {}) {
             timers.delete(entry[0]);
             entry[1].fn();
         },
-        disconnect() { displays = displays.slice(0, 1); screen.emit("display-removed"); }
+        disconnect() { displays = displays.slice(0, 1); screen.emit("display-removed"); },
+        /** Windows restarted: same monitors, new Electron ids */
+        restart() {
+            displays = displays.map(d => ({ ...d, id: d.id + 1000 }));
+            screen.emit("display-metrics-changed");
+        }
     };
 }
 
@@ -298,12 +309,41 @@ test("the native game's physical monitor bounds are converted to DIPs before mat
     assert.equal(h.effects.typing, false);
 });
 
-test("the display picker receives stable monitor ids, names, resolution and the primary screen", () => {
+test("the display picker receives monitor ids, names, position, resolution and the primary screen", () => {
     const h = harness();
     assert.deepEqual(JSON.parse(JSON.stringify(h.native.getDisplays())), [
-        { id: "1", label: "Monitor 1", primary: true, width: 1920, height: 1080 },
-        { id: "2", label: "Monitor 2", primary: false, width: 1920, height: 1080 }
+        { id: "1", label: "Monitor 1", primary: true, x: 0, y: 0, width: 1920, height: 1080 },
+        { id: "2", label: "Monitor 2", primary: false, x: 1920, y: 0, width: 1920, height: 1080 }
     ]);
+});
+
+test("the chosen screen is found again after a Windows restart changed every display id", async () => {
+    const h = harness();
+    const saved = saveMonitor(h.native.getDisplays()[1]);
+    h.games([42]);
+    h.foreground(42);
+    await h.show({ gameDisplay: saved });
+    assert.ok(h.overlay.bounds.x >= 1920);
+    h.native.setGameDisplay({}, "");
+    assert.ok(h.overlay.bounds.x < 1920);
+    h.restart();
+    h.native.setGameDisplay({}, saved);
+    assert.ok(h.overlay.bounds.x >= 1920, "the saved monitor is recognised by its name and position");
+    assert.equal(findMonitor(saved, h.native.getDisplays()).id, "1002");
+});
+
+test("a saved monitor is matched by name and position before its id", () => {
+    const monitor = (id, label, x) => ({ id, label, primary: x === 0, x, y: 0, width: 1920, height: 1080 });
+    const [left, right] = [monitor("1", "Dell", 0), monitor("2", "Dell", 1920)];
+    const saved = saveMonitor(right);
+
+    assert.equal(findMonitor(saved, [left, right]), right);
+    assert.equal(findMonitor(saved, [monitor("7", "Dell", 0), monitor("8", "Dell", 1920)]).id, "8", "identical monitors are told apart by position");
+    assert.equal(findMonitor(saved, [monitor("2", "LG", 0), monitor("9", "Dell", 1920)]).id, "9", "a reused id does not win over the name and position");
+    assert.equal(findMonitor(saved, [monitor("7", "LG", 0), monitor("8", "Dell", 3840)]).id, "8", "a moved monitor is found by its name");
+    assert.equal(findMonitor(saved, [monitor("7", "LG", 0)]), undefined);
+    assert.equal(findMonitor("2", [left, right]), right, "the bare id saved by older versions still works until the restart");
+    assert.equal(findMonitor("", [left, right]), undefined);
 });
 
 test("selecting the game's screen preserves fading and click-through; off preserves full visibility", async () => {

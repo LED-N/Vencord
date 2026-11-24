@@ -7,6 +7,7 @@
 import { app, BrowserWindow, globalShortcut, IpcMainInvokeEvent, powerMonitor, screen, shell } from "electron";
 import PAGE from "file://overlay.html";
 
+import { findMonitor } from "./displays";
 import type { OverlayAction, OverlayLayout, OverlayMonitor, OverlayNotification } from "./types";
 import { ForegroundWindow, watchForeground } from "./windowsForeground";
 
@@ -101,6 +102,14 @@ let registered: string[] = [];
 const pendingActions: OverlayAction[] = [];
 let actionWaiter: ((action: OverlayAction | null) => void) | null = null;
 
+const DISPLAY_EVENTS = ["display-added", "display-removed", "display-metrics-changed"];
+
+function watchDisplays(watch: boolean) {
+    // As a plain emitter: Electron declares one overload per event name
+    const emitter: NodeJS.EventEmitter = screen;
+    for (const event of DISPLAY_EVENTS) emitter[watch ? "on" : "removeListener"](event, refreshPlacement);
+}
+
 function run(code: string) {
     if (win && !win.isDestroyed()) win.webContents.executeJavaScript(code).catch(() => { });
 }
@@ -164,13 +173,9 @@ function getWindow() {
         pageViewport = null;
         stopTicking();
         unregisterShortcuts();
-        screen.removeListener("display-added", refreshPlacement);
-        screen.removeListener("display-removed", refreshPlacement);
-        screen.removeListener("display-metrics-changed", refreshPlacement);
+        watchDisplays(false);
     });
-    screen.on("display-added", refreshPlacement);
-    screen.on("display-removed", refreshPlacement);
-    screen.on("display-metrics-changed", refreshPlacement);
+    watchDisplays(true);
 
     ready = win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(PAGE)).then(() => { });
 
@@ -255,6 +260,14 @@ function syncFocusable() {
     // A permanently non-activating window can receive mouseup without mousedown after being hidden and reused.
     // setFocusable only permits activation on a deliberate click; showInactive keeps notifications in the background.
     win.setFocusable(allowed);
+}
+
+/** Drops any press, swipe or hover in progress: the cards let the mouse through again */
+function releasePointer() {
+    pointerDown = dragging = false;
+    hoverSince = 0;
+    setGhost(-1);
+    setInteractive(false);
 }
 
 function setGhost(index: number) {
@@ -356,10 +369,7 @@ function hoveredBox(cursor: Electron.Point, bounds: Electron.Rectangle, margin =
 
 function updateHover(index: number, now: number) {
     if (isLocked() || !layout?.clickable) {
-        pointerDown = dragging = false;
-        hoverSince = 0;
-        setGhost(-1);
-        setInteractive(false);
+        releasePointer();
         return;
     }
 
@@ -530,7 +540,8 @@ function hideOverlay() {
 
 function targetDisplay(l: OverlayLayout) {
     if (gamePids.size && l.gameDisplay) {
-        const selected = screen.getAllDisplays().find(d => String(d.id) === l.gameDisplay);
+        const id = findMonitor(l.gameDisplay, getDisplays())?.id;
+        const selected = id && screen.getAllDisplays().find(d => String(d.id) === id);
         if (selected) return selected;
     }
     if (l.display === "primary") return screen.getPrimaryDisplay();
@@ -573,11 +584,7 @@ function place(w: BrowserWindow, l: OverlayLayout) {
 
 function refreshPlacement() {
     if (win && !win.isDestroyed() && win.isVisible() && layout) {
-        dragging = false;
-        pointerDown = false;
-        hoverSince = 0;
-        setGhost(-1);
-        setInteractive(false);
+        releasePointer();
         place(win, layout);
         syncFocusable();
     }
@@ -595,13 +602,7 @@ function receiveForeground(value: ForegroundWindow | null) {
             refreshPlacement();
         }
     }
-    if (wasGaming !== inGame()) {
-        dragging = false;
-        pointerDown = false;
-        hoverSince = 0;
-        setGhost(-1);
-        setInteractive(false);
-    }
+    if (wasGaming !== inGame()) releasePointer();
     syncFocusable();
 }
 
@@ -620,6 +621,8 @@ export function getDisplays(): OverlayMonitor[] {
         id: String(d.id),
         label: d.label,
         primary: d.id === primary,
+        x: d.bounds.x,
+        y: d.bounds.y,
         width: Math.round(d.size.width * d.scaleFactor),
         height: Math.round(d.size.height * d.scaleFactor)
     }));
@@ -653,9 +656,9 @@ export function getDiagnostics() {
 }
 
 /** Moving the game-only display also moves cards that are already visible. */
-export function setGameDisplay(_: IpcMainInvokeEvent, displayId: string) {
+export function setGameDisplay(_: IpcMainInvokeEvent, gameDisplay: string) {
     if (!layout) return;
-    layout = { ...layout, gameDisplay: displayId };
+    layout = { ...layout, gameDisplay };
     refreshPlacement();
 }
 
@@ -733,9 +736,7 @@ export function destroy() {
     gameDisplayId = null;
     placedDisplayId = null;
     pointerDown = dragging = false;
-    screen.removeListener("display-added", refreshPlacement);
-    screen.removeListener("display-removed", refreshPlacement);
-    screen.removeListener("display-metrics-changed", refreshPlacement);
+    watchDisplays(false);
     unlocked = false;
     lastPadAt = 0;
     if (idleTimer) clearTimeout(idleTimer);

@@ -178,14 +178,14 @@ export function describe(id: string, kind: RuleKind, withGuild = true): string |
 
     if (kind === "user") {
         const user = UserStore.getUser(id);
-        return user ? (user as any).globalName ?? user.username : undefined;
+        return user ? user.globalName ?? user.username : undefined;
     }
 
     const channel = ChannelStore.getChannel(id);
     if (!channel) return undefined;
     if (channel.isDM()) {
         const recipient = UserStore.getUser(channel.recipients?.[0]);
-        return recipient ? `MP · ${(recipient as any).globalName ?? recipient.username}` : "Message privé";
+        return recipient ? `MP · ${recipient.globalName ?? recipient.username}` : "Message privé";
     }
     if (channel.isGroupDM()) return channel.name || groupName(channel);
 
@@ -199,7 +199,7 @@ export function describe(id: string, kind: RuleKind, withGuild = true): string |
 export function groupName(channel: Channel) {
     const names = (channel.recipients ?? []).flatMap(id => {
         const user = UserStore.getUser(id);
-        return user ? [(user as any).globalName ?? user.username] : [];
+        return user ? [user.globalName ?? user.username] : [];
     });
     return names.length ? names.join(", ") : "Groupe privé";
 }

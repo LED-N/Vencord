@@ -93,7 +93,7 @@ function userChoices(): Choice[] {
             return user ? [user] : [];
         })
         .map(user => {
-            const name = RelationshipStore.getNickname(user.id) || (user as any).globalName || user.username;
+            const name = RelationshipStore.getNickname(user.id) || user.globalName || user.username;
             const friend = RelationshipStore.isFriend(user.id);
             return { id: user.id, name, sub: friend ? (name !== user.username ? user.username : undefined) : "Pas ami", icon: userIcon(user.id) };
         })

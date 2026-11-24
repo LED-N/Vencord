@@ -8,6 +8,7 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import type { RenderModalProps } from "@vencord/discord-types";
 import { ChannelStore, Modal, openModal, useEffect, useRef, useState } from "@webpack/common";
 
+import { findMonitor, saveMonitor } from "../displays";
 import { settings } from "../settings";
 import type { OverlayMonitor, OverlayPosition } from "../types";
 import { bridge } from "./bridge";
@@ -231,11 +232,18 @@ function GameDisplayPicker() {
             hint: `${d.width} × ${d.height}`
         }))
     ];
-    if (gameDisplay && !displays?.some(d => d.id === gameDisplay)) options.push({
+    const selected = findMonitor(gameDisplay, displays ?? []);
+    if (gameDisplay && !selected) options.push({
         value: gameDisplay,
         label: displays ? "Écran déconnecté" : "Écran enregistré",
         hint: "Réglage habituel utilisé tant que cet écran est indisponible"
     });
+
+    const choose = (value: string) => {
+        if (value === gameDisplay) return;
+        const monitor = displays?.find(d => d.id === value);
+        settings.store.gameDisplay = monitor ? saveMonitor(monitor) : "";
+    };
 
     return (
         <Row title="Écran des notifications en jeu" hint={<>
@@ -244,7 +252,7 @@ function GameDisplayPicker() {
                 : displays == null ? <><br />Recherche des écrans…</>
                     : displays.length < 2 && <><br />Un seul écran détecté.</>}
         </>}>
-            <Dropdown label="Écran des notifications en jeu" options={options} value={gameDisplay} onChange={value => settings.store.gameDisplay = value} />
+            <Dropdown label="Écran des notifications en jeu" options={options} value={selected?.id ?? gameDisplay} onChange={choose} />
         </Row>
     );
 }

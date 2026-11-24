@@ -122,7 +122,7 @@ function userName(id: string, guildId?: string) {
     const user = UserStore.getUser(id);
     return (guildId ? GuildMemberStore.getNick(guildId, id) : null)
         || RelationshipStore.getNickname(id)
-        || (user as any)?.globalName
+        || user?.globalName
         || user?.username
         || "utilisateur";
 }

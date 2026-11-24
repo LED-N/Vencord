@@ -58,9 +58,14 @@ export type OverlayPosition = "bottom-right" | "top-right" | "bottom-left" | "to
 export type OverlayDisplay = "cursor" | "primary" | "discord";
 
 export interface OverlayMonitor {
+    /** Electron display id: only valid until Windows restarts */
     id: string;
     label: string;
     primary: boolean;
+    /** Origin in the virtual desktop */
+    x: number;
+    y: number;
+    /** Resolution in physical pixels */
     width: number;
     height: number;
 }
@@ -77,7 +82,7 @@ export type HoverBehavior = "interact" | "ghost";
 export interface OverlayLayout {
     position: OverlayPosition;
     display: OverlayDisplay;
-    /** Explicit display id while a detected game is running; empty keeps the usual display setting */
+    /** Monitor used while a detected game is running, as saved by saveMonitor (displays.ts); empty keeps the usual display setting */
     gameDisplay: string;
     /** Distance from the screen edges, in screen pixels */
     offsetX: number;

@@ -1,6 +1,6 @@
 # BetterNotifications — notifications en jeu
 
-Dans les réglages du plugin, ouvre **En jeu → Écran en jeu → Écran des notifications en jeu**. Choisis un moniteur dans la liste, ou **Réglage habituel** pour conserver le choix de l'onglet Apparence. Le choix est enregistré avec l'identifiant du moniteur, et s'applique aussi aux cartes déjà affichées.
+Dans les réglages du plugin, ouvre **En jeu → Écran en jeu → Écran des notifications en jeu**. Choisis un moniteur dans la liste, ou **Réglage habituel** pour conserver le choix de l'onglet Apparence. Le choix s'applique aussi aux cartes déjà affichées. Il est enregistré avec le nom, la position et la résolution du moniteur : l'identifiant qu'Electron lui donne change à chaque redémarrage de Windows et ne sert qu'à départager deux moniteurs identiques (`displays.ts`).
 
 - Sur un écran différent de celui du jeu, les notifications restent visibles même si **Estomper** ou **Masquer** est sélectionné. La protection contre les clics accidentels en jeu ne s'applique pas à cet écran. Le réglage général des cartes cliquables et le mode de survol restent respectés.
 - Sur le même écran que le jeu, les réglages **Ne rien faire / Estomper / Masquer** et **Verrouiller en jeu** continuent de s'appliquer.
